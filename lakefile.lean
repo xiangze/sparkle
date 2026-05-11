@@ -48,6 +48,9 @@ lean_lib «IP.Arbiter» where
 lean_lib «Examples.CDC» where
   roots := #[`Examples.CDC]
 
+lean_lib «Examples.FPU» where
+  roots := #[`Examples.FPU]
+
 lean_lib «IP.Video» where
   roots := #[`IP.Video]
 
@@ -56,6 +59,20 @@ lean_lib «IP.Bus» where
 
 lean_lib «Tools.SVParser» where
   roots := #[`Tools.SVParser]
+
+lean_lib «TutorialExtended» where
+  roots := #[`TutorialExtended]
+  srcDir := "tutorial-extended"
+
+lean_exe «tutorial-extended-run» where
+  root := `TutorialExtended.Run
+  srcDir := "tutorial-extended"
+  supportInterpreter := true
+
+lean_exe «tutorial-mermaid-test» where
+  root := `TutorialExtended.MermaidHelperTest
+  srcDir := "tutorial-extended"
+  supportInterpreter := true
 
 lean_lib «Tests» where
   -- Test circuits library
@@ -123,6 +140,18 @@ lean_exe «rv32-jit-linux-boot-test» where
   root := `Tests.RV32.JITLinuxBootTest
   supportInterpreter := true
 
+lean_exe «bitnet-mmio-probe» where
+  root := `Tests.RV32.BitNetMmioProbe
+  supportInterpreter := true
+
+-- End-to-end Linux driver test: boots a kernel image patched with the
+-- in-tree sparkle-bitnet driver and an initramfs /init that exercises
+-- /dev/bitnet0 against 8 golden vectors. Asserts on UART markers
+-- "sparkle-bitnet … registered" + "BITNET PASS".
+lean_exe «bitnet-linux-test» where
+  root := `Tests.Integration.BitNetLinuxTest
+  supportInterpreter := true
+
 lean_exe «h264-jit-test» where
   root := `Tests.Video.H264JITTest
   supportInterpreter := true
@@ -179,7 +208,7 @@ lean_exe «svparser-test» where
   root := `Tests.SVParser.ParserTest
   supportInterpreter := true
 
-lean_exe «verilog-sim-example» where
+lean_exe «verilog-sim-le» where
   root := `Examples.SVParser.VerilogSim
   supportInterpreter := true
 

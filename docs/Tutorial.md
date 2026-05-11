@@ -43,6 +43,100 @@ def counter8 {dom : DomainConfig}
 lake env lean tutorial.lean
 ```
 
+### Multi-output modules and `declare_signal_state`
+
+Once a module produces more than one signal, returning an
+anonymous tuple forces the caller to project by position
+(`.fst`, `.snd`, `.snd.fst`...), which scales badly. Sparkle
+ships a macro `declare_signal_state` that turns a list of named
+fields into a tuple-backed record with field accessors AND a
+named-field constructor `Name.mk`:
+
+```lean
+declare_signal_state CounterParityOut
+  | count  : BitVec 8 := 0#8
+  | parity : Bool     := false
+
+def counterAndParity {dom : DomainConfig}
+    (en : Signal dom Bool) : Signal dom CounterParityOut :=
+  Signal.loop fun self =>
+    let count      := CounterParityOut.count self        -- read by name
+    let countNext  := Signal.mux en (count + 1#8) count
+    let parityBV   := countNext.map (BitVec.extractLsb' 0 1 ·)
+    let parityNext := parityBV === Signal.pure 1#1
+    let countOut   := Signal.register 0#8 countNext
+    let parityOut  := Signal.register false parityNext
+    -- Build the output by name (output side mirrors input side):
+    CounterParityOut.mk (count := countOut) (parity := parityOut)
+
+-- Caller reads each field by name too:
+#eval
+  let out := counterAndParity (dom := defaultDomain) (Signal.pure true)
+  let cs  := (CounterParityOut.count out).sample 4
+  let ps  := (CounterParityOut.parity out).sample 4
+  s!"counts={cs}  parity={ps}"
+```
+
+`declare_signal_state` also generates `Name.default`,
+`Name.wireNames`, and `Name.fromWires` — the latter two are
+consumed by the JIT probe layer to expose the same field names
+in generated Verilog (`_gen_count`, `_gen_parity`) and JIT C++.
+
+For the full walkthrough (anonymous tuple → let-named tuple →
+record + bundleAll! → record + `Name.mk`, with the trade-offs
+of each pattern), see [`docs/Tutorial_Extended.md`](Tutorial_Extended.md).
+
+### Imperative-style hardware: `Signal.circuit do`
+
+The `Signal.loop` + `Signal.register` + `bundleAll!` pattern works
+for any module, but for a multi-register pipeline it's verbose.
+Sparkle ships a `Signal.circuit do` macro that lets you write the
+same hardware imperatively:
+
+  - `let x ← Signal.reg init` — declare a registered signal
+  - `x <~ rhs` — set `x`'s next-state value
+  - `let y := rhs` — local combinational binding
+  - `return expr` — value returned by the block
+
+The simple counter from Step 1 written this way:
+
+```lean
+def counter8' {dom : DomainConfig} : Signal dom (BitVec 8) :=
+  Signal.circuit do
+    let count ← Signal.reg 0#8;
+    count <~ count + 1#8;
+    return count
+```
+
+A 3-stage shift pipeline (a value entering `s0` reaches `s2`
+three cycles later) is just three register declarations + three
+assignments:
+
+```lean
+def shiftPipeline {dom : DomainConfig}
+    (input : Signal dom (BitVec 8)) : Signal dom (BitVec 8) :=
+  Signal.circuit do
+    let s0 ← Signal.reg 0#8;
+    let s1 ← Signal.reg 0#8;
+    let s2 ← Signal.reg 0#8;
+    s0 <~ input;
+    s1 <~ s0;
+    s2 <~ s1;
+    return s2
+```
+
+The macro desugars to `Signal.loop` + `Signal.register` + a
+`bundleAll!` over the next-state expressions. Synthesis output,
+JIT codegen, and `Signal.atTime` evaluation are identical to the
+hand-written version.
+
+When **NOT** to use it: when you also need to return multiple
+named outputs, `Name.mk` (above) plus `Signal.loop` is more
+flexible. `Signal.circuit do` returns a single Signal.
+
+Runnable examples (counter / up-down / shift / enabled): see
+[`tutorial-extended/TutorialExtended/Step8_CircuitDoNotation.lean`](../tutorial-extended/TutorialExtended/Step8_CircuitDoNotation.lean).
+
 ---
 
 ## Step 2: Generate Verilog
@@ -856,30 +950,63 @@ definition transitively called from one of those.
 
 | Topic | Where |
 |-------|-------|
+| **Module composition + named record I/O** | `docs/Tutorial_Extended.md` |
+| **LTL temporal-logic verification** | `docs/Tutorial_LTL.md` |
 | **Signal DSL syntax** | `docs/SignalDSL_Syntax.md` |
 | **Verification patterns** | `docs/Verification_Framework.md` |
 | **IP catalog** (RV32I CPU, AXI4-Lite, H.264, BitNet) | `README.md` |
 | **Benchmark** (Sparkle JIT vs Verilator) | `docs/BENCHMARK.md` |
 | **Reverse synthesis** (proof-driven FSM optimization) | `Sparkle/Core/OracleSpec.lean` |
 
+The Extended Tutorial is the recommended next read. It picks up
+where this single-counter walkthrough leaves off and shows how
+to scale to multi-output modules, hierarchical compositions, and
+debug-friendly named-wire observability — patterns you'll need
+once the design grows past one register.
+
+---
+
+## Diagram conventions
+
+Sparkle docs use **Mermaid `flowchart LR`** (left-to-right
+dataflow) for circuit block diagrams. This renders directly on
+GitHub, is text-diffable, and is the most ergonomic for the kind
+of "module → module → output" structure that dominates
+synthesizable HDL designs.
+
+The same Mermaid diagrams render inside [xeus-lean](https://github.com/Verilean/xeus-lean)
+Jupyter notebooks. See `tutorial-extended/notebooks/README.md`
+for the helper module (`#mermaid "..."` command) and an example
+notebook `sparkle_diagrams.ipynb`.
+
+For other diagram needs:
+
+| What you want | Tool | Notes |
+|---------------|------|-------|
+| Circuit block diagram | Mermaid `flowchart LR` | GitHub-renders, text-diff |
+| State machine | Mermaid `stateDiagram-v2` | GitHub-renders |
+| Cycle waveforms | (future) WaveDrom | Sparkle's `Signal` is cycle-by-cycle, natural fit |
+| Hierarchical IP tree | Mermaid `flowchart TD` (top-down) | for module instantiation hierarchies |
+
+Existing examples:
+  - `docs/Tutorial.md` — Sparkle pipeline overview (below)
+  - `docs/Tutorial_Extended.md` Step 3 — module composition
+  - `docs/Tutorial_LTL.md` Step 6, 7.3, 7.5 — premise / contract / verification stack diagrams
+
 ---
 
 ## Summary: The Sparkle Pipeline
 
-```
-  Signal DSL          Verilog (.v)
-      │                    │
-      ▼                    ▼
-  #synthesizeVerilog    sim! / verilog!
-      │                    │
-      ▼                    ▼
-  Verilog output     Parse → Sparkle IR
-      │                    │
-      ├── VCD waveform     ├── JIT C++ → .so → fast simulation
-      │                    │                      │
-      └── Formal proofs    ├── OracleReductin     ├── runSim (auto)
-          (bv_decide)      │   (proof-driven opt) │   ├─ runSingleSim
-                           │                      │   └─ runMultiDomainSim
-                           │                      │      (CDC queue)
-                           └──────────────────────┘
+```mermaid
+flowchart LR
+  SignalDSL[Signal DSL] --> Synth[#synthesizeVerilog]
+  Synth --> SV[Verilog output]
+  SV --> VCD[VCD waveform]
+  SV --> FP[Formal proofs<br/>bv_decide]
+  Verilog[Verilog .v] --> Parse[sim! / verilog!<br/>Parse → Sparkle IR]
+  Parse --> JIT[JIT C++ → .so<br/>fast simulation]
+  Parse --> Oracle[OracleReduction<br/>proof-driven opt]
+  JIT --> RunSim[runSim<br/>auto-dispatch]
+  RunSim --> Single[runSingleSim]
+  RunSim --> Multi[runMultiDomainSim<br/>CDC queue]
 ```
