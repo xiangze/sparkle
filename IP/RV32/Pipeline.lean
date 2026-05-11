@@ -189,7 +189,19 @@ def rv32iCore {dom : DomainConfig}
     -- dmem_rdata is driven externally by the memory subsystem
     -- =================================================================
     let mem_rdata := dmem_rdata
+    -- MEM/WB latch: MEM results → WB stage
 
+    let memwbNext := bundleAll! [
+      Signal.register 0#32  exmem_alu,      -- pass-through ALU result
+      Signal.register 0#32  mem_rdata,      -- loaded data from dmem
+      Signal.register 0#5   exmem_rd,
+      Signal.register false  exmem_regW,
+      Signal.register false  exmem_m2r,
+      Signal.register 0#32  exmem_pc4,
+      Signal.register false  exmem_jump,
+      Signal.register false  exmem_isCsr,
+      Signal.register 0#32  exmem_csrRdata
+    ]
     -- =================================================================
     -- EX Stage
     -- Forwarding priority: MEM→EX (exmem) > WB→EX (memwb/wb)
@@ -223,15 +235,26 @@ def rv32iCore {dom : DomainConfig}
     let flush       := (branchTaken ||| idex_jump) ||| (trap_taken ||| idex_isMret)
     let flushOrDelay := flush ||| flushDelay
 
+    -- EX/MEM latch: EX results → MEM stage
+    let exmemNext := bundleAll! [
+      Signal.register 0#32  alu_result,
+      Signal.register 0#5   idex_rd,
+      Signal.register false  idex_regWrite,
+      Signal.register false  idex_memRead,
+      Signal.register false  idex_memWrite,
+      Signal.register false  idex_memToReg,
+      Signal.register 0#32  ex_rs2,       -- forwarded store data
+      Signal.register 0#3   idex_funct3,  -- load/store width
+      Signal.register 0#32  idex_pc4,
+      Signal.register false  idex_jump,
+      Signal.register false  idex_isCsr,
+      Signal.register 0#32  csr_rdata
+    ]
+
     -- =================================================================
     -- Hazard / Stall (load-use: EX stage has load, ID reads that rd)
     -- =================================================================
-    let id_opcode := ifid_inst.map (BitVec.extractLsb' 0 7 ·)
-    let id_rd     := ifid_inst.map (BitVec.extractLsb' 7 5 ·)
-    let id_funct3 := ifid_inst.map (BitVec.extractLsb' 12 3 ·)
-    let id_rs1    := ifid_inst.map (BitVec.extractLsb' 15 5 ·)
-    let id_rs2    := ifid_inst.map (BitVec.extractLsb' 20 5 ·)
-    let id_funct7 := ifid_inst.map (BitVec.extractLsb' 25 7 ·)
+    let (id_opcode id_rd id_funct3 id_rs1 id_rs2 id_funct7) := decoderFieldsSignal ifid_inst
     let id_imm    := immGenSignal ifid_inst id_opcode
     let id_aluOp  := aluControlSignal id_opcode id_funct3 id_funct7
 
@@ -271,49 +294,29 @@ def rv32iCore {dom : DomainConfig}
     -- =================================================================
     let rf_rs1_addr := Signal.mux stall id_rs1 (imem_rdata.map (BitVec.extractLsb' 15 5 ·))
     let rf_rs2_addr := Signal.mux stall id_rs2 (imem_rdata.map (BitVec.extractLsb' 20 5 ·))
-    let rf_rs1_raw  := Signal.memory wb_addr wb_data wb_en rf_rs1_addr
-    let rf_rs2_raw  := Signal.memory wb_addr wb_data wb_en rf_rs2_addr
-
-    -- WB→ID bypass for same-cycle write/read
-    let wb_fwd_rs1      := wb_en &&& (wb_addr === id_rs1)
-    let wb_fwd_rs2      := wb_en &&& (wb_addr === id_rs2)
-    let rf_rs1_bypassed := Signal.mux wb_fwd_rs1 wb_data rf_rs1_raw
-    let rf_rs2_bypassed := Signal.mux wb_fwd_rs2 wb_data rf_rs2_raw
-
-    -- x0 hardwired to zero
+    let rf_rs1_raw := Signal.memory wb_addr wb_data wb_en rf_rs1_addr
+    let rf_rs2_raw := Signal.memory wb_addr wb_data wb_en rf_rs2_addr
+    -- WB→ID bypass
+    let wb_fwd_rs1 := wb_en &&& (wb_addr === id_rs1)
+    let wb_fwd_rs2 := wb_en &&& (wb_addr === id_rs2)
+    -- Previous-cycle WB bypass
+    let prev_fwd_rs1 := prev_wb_en &&& (prev_wb_addr === id_rs1)
+    let prev_fwd_rs2 := prev_wb_en &&& (prev_wb_addr === id_rs2)
+    let rf_rs1_bypassed := Signal.mux wb_fwd_rs1 wb_data
+                             (Signal.mux prev_fwd_rs1 prev_wb_data rf_rs1_raw)
+    let rf_rs2_bypassed := Signal.mux wb_fwd_rs2 wb_data
+                             (Signal.mux prev_fwd_rs2 prev_wb_data rf_rs2_raw)
+    -- x0 hardwiring
     let id_rs1Val := Signal.mux (id_rs1 === 0#5) (Signal.pure 0#32) rf_rs1_bypassed
     let id_rs2Val := Signal.mux (id_rs2 === 0#5) (Signal.pure 0#32) rf_rs2_bypassed
 
-    -- =================================================================
-    -- IF Stage: PC + fetch
-    -- =================================================================
-    let pcPlus4      := pcReg + 4#32
-    let fetchPCIn    := Signal.mux stall fetchPC pcReg
-    let fetchPCPlus4 := fetchPC + 4#32
+    -- -- WB→ID bypass for same-cycle write/read
+    -- let wb_fwd_rs1      := wb_en &&& (wb_addr === id_rs1)
+    -- let wb_fwd_rs2      := wb_en &&& (wb_addr === id_rs2)
+    -- let rf_rs1_bypassed := Signal.mux wb_fwd_rs1 wb_data rf_rs1_raw
+    -- let rf_rs2_bypassed := Signal.mux wb_fwd_rs2 wb_data rf_rs2_raw
 
-    -- =================================================================
-    -- PC Next
-    -- =================================================================
-    let pcNext := Signal.mux trap_taken trap_target
-                    (Signal.mux idex_isMret mret_target
-                    (Signal.mux flush jumpTarget
-                    (Signal.mux stall pcReg
-                      pcPlus4)))
-
-    -- =================================================================
-    -- Rebundle: create next-cycle registers per stage
-    -- =================================================================
     let squash := stall ||| flushOrDelay
-
-    let pcifNext := bundleAll! [
-      Signal.register 0#32           pcNext,
-      Signal.register 0#32           fetchPCIn,
-      Signal.register false          flush,
-      Signal.register 0x00000013#32
-        (Signal.mux flushOrDelay (Signal.pure nopInst) (Signal.mux stall ifid_inst imem_rdata)),
-      Signal.register 0#32           (Signal.mux stall ifid_pc  fetchPC),
-      Signal.register 0#32           (Signal.mux stall ifid_pc4 fetchPCPlus4)
-    ]
 
     let idexNext := bundleAll! [
       Signal.register 0#4   (Signal.mux squash (Signal.pure 0#4)   id_aluOp),
@@ -339,38 +342,45 @@ def rv32iCore {dom : DomainConfig}
       Signal.register 0#32  ifid_pc,
       Signal.register 0#32  ifid_pc4,
       Signal.register 0#12  id_csrAddr,
-      Signal.register 0#3   id_funct3
+      Signal.register 0#3   id_funct3 --CSR
     ]
 
-    -- EX/MEM latch: EX results → MEM stage
-    let exmemNext := bundleAll! [
-      Signal.register 0#32  alu_result,
-      Signal.register 0#5   idex_rd,
-      Signal.register false  idex_regWrite,
-      Signal.register false  idex_memRead,
-      Signal.register false  idex_memWrite,
-      Signal.register false  idex_memToReg,
-      Signal.register 0#32  ex_rs2,       -- forwarded store data
-      Signal.register 0#3   idex_funct3,  -- load/store width
-      Signal.register 0#32  idex_pc4,
-      Signal.register false  idex_jump,
-      Signal.register false  idex_isCsr,
-      Signal.register 0#32  csr_rdata
+    -- =================================================================
+    -- IF/ID register inputs
+    -- =================================================================
+    let ifid_inst_in := Signal.mux flushOrDelay (Signal.pure nopInst) (Signal.mux stall ifid_inst imem_rdata)
+    let ifid_pc_in := Signal.mux stall ifid_pc fetchPC
+    let ifid_pc4_in := Signal.mux stall ifid_pc4 fetchPCPlus4
+
+    -- =================================================================
+    -- IF Stage: PC + fetch
+    -- =================================================================
+    let pcPlus4      := pcReg + 4#32
+    let fetchPCIn    := Signal.mux stall fetchPC pcReg
+    let fetchPCPlus4 := fetchPC + 4#32
+
+    -- =================================================================
+    -- PC Next
+    -- =================================================================
+    let pcNext := Signal.mux trap_taken trap_target
+                    (Signal.mux idex_isMret mret_target
+                    (Signal.mux flush jumpTarget
+                    (Signal.mux stall pcReg
+                      pcPlus4)))
+
+    let pcifNext := bundleAll! [
+      Signal.register 0#32           pcNext,
+      Signal.register 0#32           fetchPCIn,
+      Signal.register false          flush,
+      Signal.register 0x00000013#32
+        (Signal.mux flushOrDelay (Signal.pure nopInst) (Signal.mux stall ifid_inst imem_rdata)),
+      Signal.register 0#32           (Signal.mux stall ifid_pc  fetchPC),
+      Signal.register 0#32           (Signal.mux stall ifid_pc4 fetchPCPlus4)
     ]
 
-    -- MEM/WB latch: MEM results → WB stage
-    let memwbNext := bundleAll! [
-      Signal.register 0#32  exmem_alu,      -- pass-through ALU result
-      Signal.register 0#32  mem_rdata,      -- loaded data from dmem
-      Signal.register 0#5   exmem_rd,
-      Signal.register false  exmem_regW,
-      Signal.register false  exmem_m2r,
-      Signal.register 0#32  exmem_pc4,
-      Signal.register false  exmem_jump,
-      Signal.register false  exmem_isCsr,
-      Signal.register 0#32  exmem_csrRdata
-    ]
-
+    -- =================================================================
+    -- Rebundle: create next-cycle registers per stage
+    -- =================================================================
     bundleAll! [pcifNext, idexNext, exmemNext, memwbNext]
 
   -- Output: debug_pc = pcReg
