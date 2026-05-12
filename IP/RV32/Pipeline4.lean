@@ -165,8 +165,8 @@ def rv32iCore {dom : DomainConfig}
     -- WB Stage (compute first — needed for forwarding/bypass)
     -- =================================================================
     -- Store-to-load forwarding (split compound lambda)
-    let storeAddrHi := prevStoreAddr.map (BitVec.extractLsb' 2 30 ·)
-    let loadAddrHi := exwb_alu.map (BitVec.extractLsb' 2 30 ·)
+    let storeAddrHi := prevStoreAddr[31,2] --(BitVec.extractLsb' 2 30 ·)
+    let loadAddrHi := exwb_alu[31,2]
     let addrMatch := storeAddrHi === loadAddrHi
     let storeLoadMatch := prevStoreEn &&& addrMatch
     let dmemRdataFwd := Signal.mux storeLoadMatch prevStoreData dmem_rdata
@@ -209,12 +209,12 @@ def rv32iCore {dom : DomainConfig}
     -- Hazard / Stall (depends on idex outputs and ID decode)
     -- =================================================================
     -- ID decode (from ifid_inst)
-    let id_opcode := ifid_inst.map (BitVec.extractLsb' 0 7 ·)
-    let id_rd     := ifid_inst.map (BitVec.extractLsb' 7 5 ·)
-    let id_funct3 := ifid_inst.map (BitVec.extractLsb' 12 3 ·)
-    let id_rs1    := ifid_inst.map (BitVec.extractLsb' 15 5 ·)
-    let id_rs2    := ifid_inst.map (BitVec.extractLsb' 20 5 ·)
-    let id_funct7 := ifid_inst.map (BitVec.extractLsb' 25 7 ·)
+    let id_opcode := ifid_inst[6,0] --.map (BitVec.extractLsb' 0 7 ·)
+    let id_rd     := ifid_inst[11,7]
+    let id_funct3 := ifid_inst[14,12]
+    let id_rs1    := ifid_inst[19,15]
+    let id_rs2    := ifid_inst[24,20]
+    let id_funct7 := ifid_inst[31,25]
     let id_imm := immGenSignal ifid_inst id_opcode
     let id_aluOp := aluControlSignal id_opcode id_funct3 id_funct7
     -- Control signals
@@ -242,8 +242,8 @@ def rv32iCore {dom : DomainConfig}
     let f3notZero := ~~~f3isZero
     let id_isCsr := id_isSystem &&& f3notZero
     let id_isEcall := id_isSystem &&& f3isZero
-    let id_csrAddr := ifid_inst.map (BitVec.extractLsb' 20 12 ·)
-    let mretField := ifid_inst.map (BitVec.extractLsb' 20 12 ·)
+    let id_csrAddr := ifid_inst[31,20] --.map (BitVec.extractLsb' 20 12 ·)
+    let mretField :=  ifid_inst[31,20]
     let isMretField := mretField === 0x302#12
     let id_isMret := id_isSystem &&& isMretField
 
@@ -253,10 +253,8 @@ def rv32iCore {dom : DomainConfig}
     -- =================================================================
     -- Register File (dual-read, single-write via Signal.memory)
     -- =================================================================
-    let rf_rs1_addr := Signal.mux stall id_rs1
-                         (imem_rdata.map (BitVec.extractLsb' 15 5 ·))
-    let rf_rs2_addr := Signal.mux stall id_rs2
-                         (imem_rdata.map (BitVec.extractLsb' 20 5 ·))
+    let rf_rs1_addr := Signal.mux stall id_rs1 imem_rdata[19,15]
+    let rf_rs2_addr := Signal.mux stall id_rs2 imem_rdata[24,20]
     let rf_rs1_raw := Signal.memory wb_addr wb_data wb_en rf_rs1_addr
     let rf_rs2_raw := Signal.memory wb_addr wb_data wb_en rf_rs2_addr
     -- WB→ID bypass
@@ -294,7 +292,7 @@ def rv32iCore {dom : DomainConfig}
     -- =================================================================
     let squash := stall ||| flushOrDelay
     -- CSR interface
-    let csrIsImm_bit := idex_csrFunct3.map (BitVec.extractLsb' 2 1 ·)
+    let csrIsImm_bit := idex_csrFunct3[2]
     let csrIsImm := csrIsImm_bit === 1#1
     let csrZimm  := 0#27 ++ idex_rs1Idx
 

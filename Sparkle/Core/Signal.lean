@@ -1151,10 +1151,14 @@ instance {dom : DomainConfig} {w : Nat} :
   slice s hi lo := s.map (·.extractLsb' lo (hi - lo + 1))
 
 macro_rules | `($s[$hi , $lo]) => `(HasBitSlice.slice $s $hi $lo)
+macro_rules | `($s[$v]) => `(HasBitSlice.slice $s $v $v)
 
 -- equivalence between v[hi,lo] and extractLsb' lo (hi - lo + 1)
 example {dom : DomainConfig} {w : Nat} (v : Signal dom (BitVec w)) (hi lo : Nat) :
     v[hi, lo] = v.map (BitVec.extractLsb' lo (hi - lo + 1) ·) := rfl
+
+example {dom : DomainConfig} {w : Nat} (v : Signal dom (BitVec w)) (hi  : Nat) :
+    v[hi] = v[hi,hi] := rfl
 
 
 end Sparkle.Core.Signal

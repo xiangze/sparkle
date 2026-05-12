@@ -254,7 +254,7 @@ def rv32iCore {dom : DomainConfig}
     -- =================================================================
     -- Hazard / Stall (load-use: EX stage has load, ID reads that rd)
     -- =================================================================
-    let (id_opcode id_rd id_funct3 id_rs1 id_rs2 id_funct7) := decoderFieldsSignal ifid_inst
+    let ((id_opcode, id_rd),( (id_funct3, id_rs1), (id_rs2, id_funct7))) := decoderFieldsSignal ifid_inst
     let id_imm    := immGenSignal ifid_inst id_opcode
     let id_aluOp  := aluControlSignal id_opcode id_funct3 id_funct7
 
@@ -310,11 +310,6 @@ def rv32iCore {dom : DomainConfig}
     let id_rs1Val := Signal.mux (id_rs1 === 0#5) (Signal.pure 0#32) rf_rs1_bypassed
     let id_rs2Val := Signal.mux (id_rs2 === 0#5) (Signal.pure 0#32) rf_rs2_bypassed
 
-    -- -- WB→ID bypass for same-cycle write/read
-    -- let wb_fwd_rs1      := wb_en &&& (wb_addr === id_rs1)
-    -- let wb_fwd_rs2      := wb_en &&& (wb_addr === id_rs2)
-    -- let rf_rs1_bypassed := Signal.mux wb_fwd_rs1 wb_data rf_rs1_raw
-    -- let rf_rs2_bypassed := Signal.mux wb_fwd_rs2 wb_data rf_rs2_raw
 
     let squash := stall ||| flushOrDelay
 
