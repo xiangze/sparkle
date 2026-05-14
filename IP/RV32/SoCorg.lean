@@ -1,23 +1,32 @@
 /-
-  RV32I SoC — Signal DSL (grouped design)
+  RV32I SoC — Signal DSL (flat design)
 
-  State is organised into named sub-groups via `declare_signal_state`, replacing
-  the original 124-field flat tuple with seven logically cohesive groups:
+  All state (pipeline + CLINT + CSR + AI MMIO + S-mode + MMU + UART + divider) in a single Signal.loop.
+  122 registers total in a right-nested pair.
 
-    PipelineState   – IF/ID/EX/WB pipeline registers (pcReg … prevStoreEn)
-    CLINTState      – CLINT timer/software-interrupt registers
-    CSRMState       – M-mode CSRs (mstatus, mie, mtvec, …)
-    SModeCsrState   – S-mode CSRs + privilege (privMode, sie, stvec, …)
-    AExtState       – A-extension reservation + AMO pending-write
-    MMUState        – MMU/PTW state machines and 4-entry TLB
-    UARTState       – UART 8250 registers (LCR, IER, MCR, SCR, DLL, DLM)
-
-  The SoCState record collects these groups plus the few singleton registers
-  (aiMMIO, exwb_funct3, idex_isMext, counters, divider, D-side miss, stall/mip).
-
-  All register-index comments from the original flat design are preserved as
-  in-line remarks so the SoCVerilog / JIT downstream can still cross-reference
-  them.
+  Register index map (0-117):
+  Pipeline (0-43): same as Pipeline.lean, except exwb_physAddr inserted at index 31
+    0=pcReg, 1=fetchPC, 2=flushDelay, 3-5=ifid_inst/pc/pc4,
+    6-18=idex control, 19-29=idex data, 30=exwb_alu, 31=exwb_physAddr,
+    32-37=exwb_rd/regW/m2r/pc4/jump/isCsr, 38=exwb_csrRdata,
+    39-41=prev_wb_addr/data/en, 42-44=prevStoreAddr/Data/En
+  CLINT (45-49): msip, mtimeLo, mtimeHi, mtimecmpLo, mtimecmpHi
+  CSR (50-56): mstatus, mie, mtvec, mscratch, mepc, mcause, mtval
+  AI MMIO (57-58): aiStatus, aiInput
+  Sub-word (59): exwb_funct3
+  M-ext (60): idex_isMext
+  A-ext (61-69): reservationValid, reservationAddr, idex_isAMO, idex_amoOp, exwb_isAMO, exwb_amoOp,
+                 pendingWriteEn, pendingWriteAddr, pendingWriteData
+  S-mode CSRs + privilege (70-79): privMode, sie, stvec, sscratch, sepc, scause, stval, satp,
+                                    medeleg, mideleg
+  MMU TLB + PTW (80-107): mmuState, ptwState, ptwVaddr, ptwPte, ptwMega, replPtr,
+                           4×TLB entries (valid, vpn, ppn, flags, mega),
+                           ptwIsIfetch, ifetchFaultPending
+  Pipeline additions (108-109): idex_isSret, idex_isSFenceVMA
+  UART 8250 (110-115): uartLCR, uartIER, uartMCR, uartSCR, uartDLL, uartDLM
+  Counter CSRs (116-117): mcounteren, scounteren
+  Divider (118): divPending
+  D-side TLB miss (119-121): dMissPC, dMissVaddr, dMissIsStore
 
   Bug fixes ported from verilator/rv32i_soc.sv:
   1. exwb_physAddr: WB bus decode uses physical address (not virtual alu_result)
@@ -64,6 +73,9 @@ import IP.RV32.UART.Decode
 import IP.RV32.UART.ReadMux
 import IP.RV32.Divider
 import IP.RV32.CSR.Types
+-- Level-1a BitNet MMIO peripheral wrapper.
+-- Exposes `bitNetPeripheral : Signal dom (BitVec 32) → Signal dom (BitVec 32)`
+-- which we wire into the AI MMIO region at 0x40000000 below.
 import IP.RV32.BitNetPeripheral
 import IP.RV32.AMO.Reservation
 import IP.RV32.AMO.Decode
@@ -113,7 +125,7 @@ import IP.RV32.Pipeline.StoreLoadFwd
 set_option maxRecDepth 65536
 set_option maxHeartbeats 16000000
 
-namespace Sparkle.IP.RV32.SoC
+namespace Sparkle.IP.RV32.SoCorg
 
 open Sparkle.Core.Domain
 open Sparkle.Core.Signal
@@ -126,19 +138,11 @@ def nopInst : BitVec 32 := 0x00000013#32
 -- rv32iSoC (synthesis-only, phantom-type-safe version) is in SoCVerilog.lean
 -- to prevent module-init stack overflow from closed-term evaluation.
 
--- ============================================================================
--- Sub-group state declarations
--- ============================================================================
-
-/-- Pipeline stage registers (indices 0–44 in the original flat layout).
-    Covers IF, IF/ID latch, ID/EX control + data, EX/WB latch,
-    WB-forwarding shadow, and store-history shadow. -/
-declare_signal_state PipelineState
-  -- IF (0-2)
+declare_signal_state SoCState
+  -- Pipeline (0-5)
   | pcReg          : BitVec 32  := 0#32
   | fetchPC        : BitVec 32  := 0#32
   | flushDelay     : Bool       := false
-  -- IF/ID latch (3-5)
   | ifid_inst      : BitVec 32  := 0x00000013#32
   | ifid_pc        : BitVec 32  := 0#32
   | ifid_pc4       : BitVec 32  := 0#32
@@ -168,7 +172,7 @@ declare_signal_state PipelineState
   | idex_pc4       : BitVec 32  := 0#32
   | idex_csrAddr   : BitVec 12  := 0#12
   | idex_csrFunct3 : BitVec 3   := 0#3
-  -- EX/WB latch (30-38)
+  -- EX/WB (30-38)
   | exwb_alu       : BitVec 32  := 0#32
   | exwb_physAddr  : BitVec 32  := 0#32
   | exwb_rd        : BitVec 5   := 0#5
@@ -178,34 +182,21 @@ declare_signal_state PipelineState
   | exwb_jump      : Bool       := false
   | exwb_isCsr     : Bool       := false
   | exwb_csrRdata  : BitVec 32  := 0#32
-  -- WB-forwarding shadow (39-41)
+  -- WB forwarding (39-41)
   | prev_wb_addr   : BitVec 5   := 0#5
   | prev_wb_data   : BitVec 32  := 0#32
   | prev_wb_en     : Bool       := false
-  -- Store-history shadow (42-44)
+  -- Store history (42-44)
   | prevStoreAddr  : BitVec 32  := 0#32
   | prevStoreData  : BitVec 32  := 0#32
   | prevStoreEn    : Bool       := false
-  -- Sub-word / M-ext pipeline fields (59-60, kept here for pipeline locality)
-  | exwb_funct3    : BitVec 3   := 0#3
-  | idex_isMext    : Bool       := false
-  -- Pipeline S-mode additions (108-109)
-  | idex_isSret      : Bool     := false
-  | idex_isSFenceVMA : Bool     := false
-  -- Stall-delay register (122)
-  -- Captures previous-cycle `stall` to squash double-latch on ifetchStall release.
-  | stallDelay     : Bool       := false
-
-/-- CLINT timer / software-interrupt registers (indices 45–49). -/
-declare_signal_state CLINTState
+  -- CLINT (45-49)
   | msipReg        : BitVec 32  := 0#32
   | mtimeLoReg     : BitVec 32  := 0#32
   | mtimeHiReg     : BitVec 32  := 0#32
   | mtimecmpLoReg  : BitVec 32  := 0xFFFFFFFF#32
   | mtimecmpHiReg  : BitVec 32  := 0xFFFFFFFF#32
-
-/-- M-mode CSRs (indices 50–56) plus the software-writable mip bits (123). -/
-declare_signal_state CSRMState
+  -- CSR M-mode (50-56)
   | mstatusReg     : BitVec 32  := 0#32
   | mieReg         : BitVec 32  := 0#32
   | mtvecReg       : BitVec 32  := 0#32
@@ -213,13 +204,24 @@ declare_signal_state CSRMState
   | mepcReg        : BitVec 32  := 0#32
   | mcauseReg      : BitVec 32  := 0#32
   | mtvalReg       : BitVec 32  := 0#32
-  -- SW-writable S-mode pending bits of mip (SSIP=1, STIP=5, SEIP=9).
-  -- M-mode bits (MSIP=3, MTIP=7) are hardware-driven from CLINT and ORed at read time.
-  | mipSoftReg     : BitVec 32  := 0#32
-
-/-- S-mode CSRs + privilege mode + delegation + counter-enable registers
-    (indices 70–79, 116–117). -/
-declare_signal_state SModeCsrState
+  -- AI MMIO (57-58)
+  | aiStatusReg    : BitVec 32  := 0#32
+  | aiInputReg     : BitVec 32  := 0#32
+  -- Sub-word (59)
+  | exwb_funct3    : BitVec 3   := 0#3
+  -- M-ext (60)
+  | idex_isMext    : Bool       := false
+  -- A-ext (61-69)
+  | reservationValid : Bool     := false
+  | reservationAddr  : BitVec 32 := 0#32
+  | idex_isAMO     : Bool       := false
+  | idex_amoOp     : BitVec 5   := 0#5
+  | exwb_isAMO     : Bool       := false
+  | exwb_amoOp     : BitVec 5   := 0#5
+  | pendingWriteEn   : Bool     := false
+  | pendingWriteAddr : BitVec 32 := 0#32
+  | pendingWriteData : BitVec 32 := 0#32
+  -- S-mode CSRs + privilege (70-79)
   | privMode       : BitVec 2   := 3#2
   | sieReg         : BitVec 32  := 0#32
   | stvecReg       : BitVec 32  := 0#32
@@ -230,93 +232,69 @@ declare_signal_state SModeCsrState
   | satpReg        : BitVec 32  := 0#32
   | medelegReg     : BitVec 32  := 0#32
   | midelegReg     : BitVec 32  := 0#32
-  -- Counter-enable CSRs (116-117)
-  | mcounterenReg  : BitVec 32  := 0#32
-  | scounterenReg  : BitVec 32  := 0#32
-
-/-- A-extension: LR/SC reservation and non-LR/SC AMO pending-write
-    (indices 61–69). -/
-declare_signal_state AExtState
-  | reservationValid : Bool      := false
-  | reservationAddr  : BitVec 32 := 0#32
-  | idex_isAMO     : Bool       := false
-  | idex_amoOp     : BitVec 5   := 0#5
-  | exwb_isAMO     : Bool       := false
-  | exwb_amoOp     : BitVec 5   := 0#5
-  | pendingWriteEn   : Bool     := false
-  | pendingWriteAddr : BitVec 32 := 0#32
-  | pendingWriteData : BitVec 32 := 0#32
-
-/-- MMU/PTW state machines and 4-entry shared TLB (indices 80–107, 119–121). -/
-declare_signal_state MMUState
-  -- MMU/PTW FSM (80-85)
+  -- MMU TLB + PTW (80-107)
   | mmuStateReg    : BitVec 3   := 0#3
   | ptwStateReg    : BitVec 3   := 0#3
   | ptwVaddrReg    : BitVec 32  := 0#32
   | ptwPteReg      : BitVec 32  := 0#32
   | ptwMegaReg     : Bool       := false
   | replPtrReg     : BitVec 2   := 0#2
-  -- TLB entry 0 (86-90)
   | tlb0Valid      : Bool       := false
   | tlb0VPN        : BitVec 20  := 0#20
   | tlb0PPN        : BitVec 22  := 0#22
   | tlb0Flags      : BitVec 8   := 0#8
   | tlb0Mega       : Bool       := false
-  -- TLB entry 1 (91-95)
   | tlb1Valid      : Bool       := false
   | tlb1VPN        : BitVec 20  := 0#20
   | tlb1PPN        : BitVec 22  := 0#22
   | tlb1Flags      : BitVec 8   := 0#8
   | tlb1Mega       : Bool       := false
-  -- TLB entry 2 (96-100)
   | tlb2Valid      : Bool       := false
   | tlb2VPN        : BitVec 20  := 0#20
   | tlb2PPN        : BitVec 22  := 0#22
   | tlb2Flags      : BitVec 8   := 0#8
   | tlb2Mega       : Bool       := false
-  -- TLB entry 3 (101-105)
   | tlb3Valid      : Bool       := false
   | tlb3VPN        : BitVec 20  := 0#20
   | tlb3PPN        : BitVec 22  := 0#22
   | tlb3Flags      : BitVec 8   := 0#8
   | tlb3Mega       : Bool       := false
-  -- I-fetch fault tracking (106-107)
   | ptwIsIfetch    : Bool       := false
   | ifetchFaultPending : Bool   := false
-  -- D-side TLB miss latches (119-121)
-  | dMissPC        : BitVec 32  := 0#32
-  | dMissVaddr     : BitVec 32  := 0#32
-  | dMissIsStore   : Bool       := false
-
-/-- UART 16550-compatible (8250) registers (indices 110–115). -/
-declare_signal_state UARTState
+  -- Pipeline additions (108-109)
+  | idex_isSret      : Bool     := false
+  | idex_isSFenceVMA : Bool     := false
+  -- UART 8250 registers (110-115)
   | uartLCRReg     : BitVec 8   := 0#8
   | uartIERReg     : BitVec 8   := 0#8
   | uartMCRReg     : BitVec 8   := 0#8
   | uartSCRReg     : BitVec 8   := 0#8
   | uartDLLReg     : BitVec 8   := 0#8
   | uartDLMReg     : BitVec 8   := 0#8
-
-/-- Top-level SoC state: collects the seven sub-groups plus singleton registers
-    that don't belong to any sub-group (AI MMIO, divider). -/
-declare_signal_state SoCState
-  | pipe   : PipelineState   := {}
-  | clint  : CLINTState      := {}
-  | csrm   : CSRMState       := {}
-  | smode  : SModeCsrState   := {}
-  | aext   : AExtState       := {}
-  | mmu    : MMUState        := {}
-  | uart   : UARTState       := {}
-  -- AI MMIO (57-58)
-  | aiStatusReg    : BitVec 32  := 0#32
-  | aiInputReg     : BitVec 32  := 0#32
+  -- Counter CSRs (116-117)
+  | mcounterenReg  : BitVec 32  := 0#32
+  | scounterenReg  : BitVec 32  := 0#32
   -- Divider pending (118)
   | divPending     : Bool       := false
+  -- D-side TLB miss registers (119-121)
+  | dMissPC        : BitVec 32  := 0#32
+  | dMissVaddr     : BitVec 32  := 0#32
+  | dMissIsStore   : Bool       := false
+  -- Stall-delay register (122). Captures previous-cycle's `stall` so that
+  -- the cycle-after-stall-release squashes its IDEX, preventing the same
+  -- instruction from being latched twice (see squash usage above).
+  | stallDelay     : Bool       := false
+  -- mip software-writable bits (123). Only the S-mode pending bits
+  -- (SSIP=1, STIP=5, SEIP=9) are writable; the M-mode pending bits
+  -- (MSIP=3, MTIP=7) are hardware-driven from CLINT and ORed at read time.
+  -- Used by OpenSBI's `csr_set(CSR_MIP, MIP_STIP)` to forward timer
+  -- interrupts to S-mode.
+  | mipSoftReg     : BitVec 32  := 0#32
 
 /-- Loop body for RV32I SoC (122 registers).
     Parameterized by `imem_rdata` (pre-resolved instruction read data) so the
     same body works for simulation and synthesis. Callers compute imem_rdata:
-    - Simulation: `(projN! state 122 1)[13,12] |>.map firmware`
+    - Simulation: `(projN! state 122 1).map (BitVec.extractLsb' 2 12 ·) |>.map firmware`
     - Synthesis:  `Signal.memoryComboRead wr_addr wr_data wr_en imem_addr`
     Optionally takes DMEM external write signals for synthesis firmware loading. -/
 def rv32iSoCBody {dom : DomainConfig}
@@ -325,141 +303,138 @@ def rv32iSoCBody {dom : DomainConfig}
     (dmemExtWriteAddr : Signal dom (BitVec 23) := Signal.pure 0#23)
     (dmemExtWriteData : Signal dom (BitVec 32) := Signal.pure 0#32)
     (state : Signal dom SoCState) : Signal dom SoCState :=
-    -- =========================================================================
-    -- Unpack all sub-group fields
-    -- =========================================================================
-    -- Pipeline
-    let pcReg          := PipelineState.pcReg          (SoCState.pipe state)
-    let fetchPC        := PipelineState.fetchPC        (SoCState.pipe state)
-    let flushDelay     := PipelineState.flushDelay     (SoCState.pipe state)
-    let stallDelay     := PipelineState.stallDelay     (SoCState.pipe state)
-    let ifid_inst      := PipelineState.ifid_inst      (SoCState.pipe state)
-    let ifid_pc        := PipelineState.ifid_pc        (SoCState.pipe state)
-    let ifid_pc4       := PipelineState.ifid_pc4       (SoCState.pipe state)
-    let idex_aluOp     := PipelineState.idex_aluOp     (SoCState.pipe state)
-    let idex_regWrite  := PipelineState.idex_regWrite  (SoCState.pipe state)
-    let idex_memRead   := PipelineState.idex_memRead   (SoCState.pipe state)
-    let idex_memWrite  := PipelineState.idex_memWrite  (SoCState.pipe state)
-    let idex_memToReg  := PipelineState.idex_memToReg  (SoCState.pipe state)
-    let idex_branch    := PipelineState.idex_branch    (SoCState.pipe state)
-    let idex_jump      := PipelineState.idex_jump      (SoCState.pipe state)
-    let idex_auipc     := PipelineState.idex_auipc     (SoCState.pipe state)
-    let idex_aluSrcB   := PipelineState.idex_aluSrcB   (SoCState.pipe state)
-    let idex_isJalr    := PipelineState.idex_isJalr    (SoCState.pipe state)
-    let idex_isCsr     := PipelineState.idex_isCsr     (SoCState.pipe state)
-    let idex_isEcall   := PipelineState.idex_isEcall   (SoCState.pipe state)
-    let idex_isMret    := PipelineState.idex_isMret    (SoCState.pipe state)
-    let idex_rs1Val    := PipelineState.idex_rs1Val    (SoCState.pipe state)
-    let idex_rs2Val    := PipelineState.idex_rs2Val    (SoCState.pipe state)
-    let idex_imm       := PipelineState.idex_imm       (SoCState.pipe state)
-    let idex_rd        := PipelineState.idex_rd        (SoCState.pipe state)
-    let idex_rs1Idx    := PipelineState.idex_rs1Idx    (SoCState.pipe state)
-    let idex_rs2Idx    := PipelineState.idex_rs2Idx    (SoCState.pipe state)
-    let idex_funct3    := PipelineState.idex_funct3    (SoCState.pipe state)
-    let idex_pc        := PipelineState.idex_pc        (SoCState.pipe state)
-    let idex_pc4       := PipelineState.idex_pc4       (SoCState.pipe state)
-    let idex_csrAddr   := PipelineState.idex_csrAddr   (SoCState.pipe state)
-    let idex_csrFunct3 := PipelineState.idex_csrFunct3 (SoCState.pipe state)
-    let exwb_alu       := PipelineState.exwb_alu       (SoCState.pipe state)
-    let exwb_physAddr  := PipelineState.exwb_physAddr  (SoCState.pipe state)
-    let exwb_rd        := PipelineState.exwb_rd        (SoCState.pipe state)
-    let exwb_regW      := PipelineState.exwb_regW      (SoCState.pipe state)
-    let exwb_m2r       := PipelineState.exwb_m2r       (SoCState.pipe state)
-    let exwb_pc4       := PipelineState.exwb_pc4       (SoCState.pipe state)
-    let exwb_jump      := PipelineState.exwb_jump      (SoCState.pipe state)
-    let exwb_isCsr     := PipelineState.exwb_isCsr     (SoCState.pipe state)
-    let exwb_csrRdata  := PipelineState.exwb_csrRdata  (SoCState.pipe state)
-    let prev_wb_addr   := PipelineState.prev_wb_addr   (SoCState.pipe state)
-    let prev_wb_data   := PipelineState.prev_wb_data   (SoCState.pipe state)
-    let prev_wb_en     := PipelineState.prev_wb_en     (SoCState.pipe state)
-    let prevStoreAddr  := PipelineState.prevStoreAddr  (SoCState.pipe state)
-    let prevStoreData  := PipelineState.prevStoreData  (SoCState.pipe state)
-    let prevStoreEn    := PipelineState.prevStoreEn    (SoCState.pipe state)
-    let exwb_funct3    := PipelineState.exwb_funct3    (SoCState.pipe state)
-    let idex_isMext    := PipelineState.idex_isMext    (SoCState.pipe state)
-    let idex_isSret      := PipelineState.idex_isSret      (SoCState.pipe state)
-    let idex_isSFenceVMA := PipelineState.idex_isSFenceVMA (SoCState.pipe state)
-    -- CLINT
-    let msipReg        := CLINTState.msipReg       (SoCState.clint state)
-    let mtimeLoReg     := CLINTState.mtimeLoReg    (SoCState.clint state)
-    let mtimeHiReg     := CLINTState.mtimeHiReg    (SoCState.clint state)
-    let mtimecmpLoReg  := CLINTState.mtimecmpLoReg (SoCState.clint state)
-    let mtimecmpHiReg  := CLINTState.mtimecmpHiReg (SoCState.clint state)
-    -- M-mode CSRs
-    let mstatusReg     := CSRMState.mstatusReg  (SoCState.csrm state)
-    let mieReg         := CSRMState.mieReg      (SoCState.csrm state)
-    let mtvecReg       := CSRMState.mtvecReg    (SoCState.csrm state)
-    let mscratchReg    := CSRMState.mscratchReg (SoCState.csrm state)
-    let mepcReg        := CSRMState.mepcReg     (SoCState.csrm state)
-    let mcauseReg      := CSRMState.mcauseReg   (SoCState.csrm state)
-    let mtvalReg       := CSRMState.mtvalReg    (SoCState.csrm state)
-    let mipSoftReg     := CSRMState.mipSoftReg  (SoCState.csrm state)
-    -- S-mode CSRs + privilege
-    let privMode       := SModeCsrState.privMode      (SoCState.smode state)
-    let sieReg         := SModeCsrState.sieReg        (SoCState.smode state)
-    let stvecReg       := SModeCsrState.stvecReg      (SoCState.smode state)
-    let sscratchReg    := SModeCsrState.sscratchReg   (SoCState.smode state)
-    let sepcReg        := SModeCsrState.sepcReg       (SoCState.smode state)
-    let scauseReg      := SModeCsrState.scauseReg     (SoCState.smode state)
-    let stvalReg       := SModeCsrState.stvalReg      (SoCState.smode state)
-    let satpReg        := SModeCsrState.satpReg       (SoCState.smode state)
-    let medelegReg     := SModeCsrState.medelegReg    (SoCState.smode state)
-    let midelegReg     := SModeCsrState.midelegReg    (SoCState.smode state)
-    let mcounterenReg  := SModeCsrState.mcounterenReg (SoCState.smode state)
-    let scounterenReg  := SModeCsrState.scounterenReg (SoCState.smode state)
-    -- A-extension
-    let reservationValid := AExtState.reservationValid (SoCState.aext state)
-    let reservationAddr  := AExtState.reservationAddr  (SoCState.aext state)
-    let idex_isAMO       := AExtState.idex_isAMO       (SoCState.aext state)
-    let idex_amoOp       := AExtState.idex_amoOp       (SoCState.aext state)
-    let exwb_isAMO       := AExtState.exwb_isAMO       (SoCState.aext state)
-    let exwb_amoOp       := AExtState.exwb_amoOp       (SoCState.aext state)
-    let pendingWriteEn   := AExtState.pendingWriteEn   (SoCState.aext state)
-    let pendingWriteAddr := AExtState.pendingWriteAddr (SoCState.aext state)
-    let pendingWriteData := AExtState.pendingWriteData (SoCState.aext state)
-    -- MMU/TLB
-    let mmuStateReg      := MMUState.mmuStateReg      (SoCState.mmu state)
-    let ptwStateReg      := MMUState.ptwStateReg      (SoCState.mmu state)
-    let ptwVaddrReg      := MMUState.ptwVaddrReg      (SoCState.mmu state)
-    let ptwPteReg        := MMUState.ptwPteReg        (SoCState.mmu state)
-    let ptwMegaReg       := MMUState.ptwMegaReg       (SoCState.mmu state)
-    let replPtrReg       := MMUState.replPtrReg       (SoCState.mmu state)
-    let tlb0Valid        := MMUState.tlb0Valid        (SoCState.mmu state)
-    let tlb0VPN          := MMUState.tlb0VPN          (SoCState.mmu state)
-    let tlb0PPN          := MMUState.tlb0PPN          (SoCState.mmu state)
-    let tlb0Flags        := MMUState.tlb0Flags        (SoCState.mmu state)
-    let tlb0Mega         := MMUState.tlb0Mega         (SoCState.mmu state)
-    let tlb1Valid        := MMUState.tlb1Valid        (SoCState.mmu state)
-    let tlb1VPN          := MMUState.tlb1VPN          (SoCState.mmu state)
-    let tlb1PPN          := MMUState.tlb1PPN          (SoCState.mmu state)
-    let tlb1Flags        := MMUState.tlb1Flags        (SoCState.mmu state)
-    let tlb1Mega         := MMUState.tlb1Mega         (SoCState.mmu state)
-    let tlb2Valid        := MMUState.tlb2Valid        (SoCState.mmu state)
-    let tlb2VPN          := MMUState.tlb2VPN          (SoCState.mmu state)
-    let tlb2PPN          := MMUState.tlb2PPN          (SoCState.mmu state)
-    let tlb2Flags        := MMUState.tlb2Flags        (SoCState.mmu state)
-    let tlb2Mega         := MMUState.tlb2Mega         (SoCState.mmu state)
-    let tlb3Valid        := MMUState.tlb3Valid        (SoCState.mmu state)
-    let tlb3VPN          := MMUState.tlb3VPN          (SoCState.mmu state)
-    let tlb3PPN          := MMUState.tlb3PPN          (SoCState.mmu state)
-    let tlb3Flags        := MMUState.tlb3Flags        (SoCState.mmu state)
-    let tlb3Mega         := MMUState.tlb3Mega         (SoCState.mmu state)
-    let ptwIsIfetch      := MMUState.ptwIsIfetch      (SoCState.mmu state)
-    let ifetchFaultPending := MMUState.ifetchFaultPending (SoCState.mmu state)
-    let dMissPC          := MMUState.dMissPC          (SoCState.mmu state)
-    let dMissVaddr       := MMUState.dMissVaddr       (SoCState.mmu state)
-    let dMissIsStore     := MMUState.dMissIsStore     (SoCState.mmu state)
-    -- UART
-    let uartLCRReg   := UARTState.uartLCRReg (SoCState.uart state)
-    let uartIERReg   := UARTState.uartIERReg (SoCState.uart state)
-    let uartMCRReg   := UARTState.uartMCRReg (SoCState.uart state)
-    let uartSCRReg   := UARTState.uartSCRReg (SoCState.uart state)
-    let uartDLLReg   := UARTState.uartDLLReg (SoCState.uart state)
-    let uartDLMReg   := UARTState.uartDLMReg (SoCState.uart state)
-    -- Singletons
-    let aiStatusReg  := SoCState.aiStatusReg state
-    let aiInputReg   := SoCState.aiInputReg  state
-    let divPending   := SoCState.divPending  state
+    -- Extract all 122 register outputs via accessor defs
+    let pcReg          := SoCState.pcReg state
+    let fetchPC        := SoCState.fetchPC state
+    let flushDelay     := SoCState.flushDelay state
+    let stallDelay     := SoCState.stallDelay state
+    let ifid_inst      := SoCState.ifid_inst state
+    let ifid_pc        := SoCState.ifid_pc state
+    let ifid_pc4       := SoCState.ifid_pc4 state
+    let idex_aluOp     := SoCState.idex_aluOp state
+    let idex_regWrite  := SoCState.idex_regWrite state
+    let idex_memRead   := SoCState.idex_memRead state
+    let idex_memWrite  := SoCState.idex_memWrite state
+    let idex_memToReg  := SoCState.idex_memToReg state
+    let idex_branch    := SoCState.idex_branch state
+    let idex_jump      := SoCState.idex_jump state
+    let idex_auipc     := SoCState.idex_auipc state
+    let idex_aluSrcB   := SoCState.idex_aluSrcB state
+    let idex_isJalr    := SoCState.idex_isJalr state
+    let idex_isCsr     := SoCState.idex_isCsr state
+    let idex_isEcall   := SoCState.idex_isEcall state
+    let idex_isMret    := SoCState.idex_isMret state
+    let idex_rs1Val    := SoCState.idex_rs1Val state
+    let idex_rs2Val    := SoCState.idex_rs2Val state
+    let idex_imm       := SoCState.idex_imm state
+    let idex_rd        := SoCState.idex_rd state
+    let idex_rs1Idx    := SoCState.idex_rs1Idx state
+    let idex_rs2Idx    := SoCState.idex_rs2Idx state
+    let idex_funct3    := SoCState.idex_funct3 state
+    let idex_pc        := SoCState.idex_pc state
+    let idex_pc4       := SoCState.idex_pc4 state
+    let idex_csrAddr   := SoCState.idex_csrAddr state
+    let idex_csrFunct3 := SoCState.idex_csrFunct3 state
+    let exwb_alu       := SoCState.exwb_alu state
+    let exwb_physAddr  := SoCState.exwb_physAddr state
+    let exwb_rd        := SoCState.exwb_rd state
+    let exwb_regW      := SoCState.exwb_regW state
+    let exwb_m2r       := SoCState.exwb_m2r state
+    let exwb_pc4       := SoCState.exwb_pc4 state
+    let exwb_jump      := SoCState.exwb_jump state
+    let exwb_isCsr     := SoCState.exwb_isCsr state
+    let exwb_csrRdata  := SoCState.exwb_csrRdata state
+    let prev_wb_addr   := SoCState.prev_wb_addr state
+    let prev_wb_data   := SoCState.prev_wb_data state
+    let prev_wb_en     := SoCState.prev_wb_en state
+    let prevStoreAddr  := SoCState.prevStoreAddr state
+    let prevStoreData  := SoCState.prevStoreData state
+    let prevStoreEn    := SoCState.prevStoreEn state
+    let msipReg        := SoCState.msipReg state
+    let mtimeLoReg     := SoCState.mtimeLoReg state
+    let mtimeHiReg     := SoCState.mtimeHiReg state
+    let mtimecmpLoReg  := SoCState.mtimecmpLoReg state
+    let mtimecmpHiReg  := SoCState.mtimecmpHiReg state
+    let mstatusReg     := SoCState.mstatusReg state
+    let mieReg         := SoCState.mieReg state
+    let mtvecReg       := SoCState.mtvecReg state
+    let mscratchReg    := SoCState.mscratchReg state
+    let mepcReg        := SoCState.mepcReg state
+    let mcauseReg      := SoCState.mcauseReg state
+    let mtvalReg       := SoCState.mtvalReg state
+    let mipSoftReg     := SoCState.mipSoftReg state
+    let aiStatusReg    := SoCState.aiStatusReg state
+    let aiInputReg     := SoCState.aiInputReg state
+    let exwb_funct3    := SoCState.exwb_funct3 state
+    let idex_isMext    := SoCState.idex_isMext state
+    let reservationValid := SoCState.reservationValid state
+    let reservationAddr  := SoCState.reservationAddr state
+    let idex_isAMO     := SoCState.idex_isAMO state
+    let idex_amoOp     := SoCState.idex_amoOp state
+    let exwb_isAMO     := SoCState.exwb_isAMO state
+    let exwb_amoOp     := SoCState.exwb_amoOp state
+    let pendingWriteEn   := SoCState.pendingWriteEn state
+    let pendingWriteAddr := SoCState.pendingWriteAddr state
+    let pendingWriteData := SoCState.pendingWriteData state
+    -- S-mode CSRs + privilege (70-79)
+    let privMode         := SoCState.privMode state
+    let sieReg           := SoCState.sieReg state
+    let stvecReg         := SoCState.stvecReg state
+    let sscratchReg      := SoCState.sscratchReg state
+    let sepcReg          := SoCState.sepcReg state
+    let scauseReg        := SoCState.scauseReg state
+    let stvalReg         := SoCState.stvalReg state
+    let satpReg          := SoCState.satpReg state
+    let medelegReg       := SoCState.medelegReg state
+    let midelegReg       := SoCState.midelegReg state
+    -- MMU TLB + PTW (80-107)
+    let mmuStateReg      := SoCState.mmuStateReg state
+    let ptwStateReg      := SoCState.ptwStateReg state
+    let ptwVaddrReg      := SoCState.ptwVaddrReg state
+    let ptwPteReg        := SoCState.ptwPteReg state
+    let ptwMegaReg       := SoCState.ptwMegaReg state
+    let replPtrReg       := SoCState.replPtrReg state
+    let tlb0Valid        := SoCState.tlb0Valid state
+    let tlb0VPN          := SoCState.tlb0VPN state
+    let tlb0PPN          := SoCState.tlb0PPN state
+    let tlb0Flags        := SoCState.tlb0Flags state
+    let tlb0Mega         := SoCState.tlb0Mega state
+    let tlb1Valid        := SoCState.tlb1Valid state
+    let tlb1VPN          := SoCState.tlb1VPN state
+    let tlb1PPN          := SoCState.tlb1PPN state
+    let tlb1Flags        := SoCState.tlb1Flags state
+    let tlb1Mega         := SoCState.tlb1Mega state
+    let tlb2Valid        := SoCState.tlb2Valid state
+    let tlb2VPN          := SoCState.tlb2VPN state
+    let tlb2PPN          := SoCState.tlb2PPN state
+    let tlb2Flags        := SoCState.tlb2Flags state
+    let tlb2Mega         := SoCState.tlb2Mega state
+    let tlb3Valid        := SoCState.tlb3Valid state
+    let tlb3VPN          := SoCState.tlb3VPN state
+    let tlb3PPN          := SoCState.tlb3PPN state
+    let tlb3Flags        := SoCState.tlb3Flags state
+    let tlb3Mega         := SoCState.tlb3Mega state
+    let ptwIsIfetch      := SoCState.ptwIsIfetch state
+    let ifetchFaultPending := SoCState.ifetchFaultPending state
+    -- Pipeline additions (108-109)
+    let idex_isSret      := SoCState.idex_isSret state
+    let idex_isSFenceVMA := SoCState.idex_isSFenceVMA state
+    -- UART 8250 registers (110-115)
+    let uartLCRReg   := SoCState.uartLCRReg state
+    let uartIERReg   := SoCState.uartIERReg state
+    let uartMCRReg   := SoCState.uartMCRReg state
+    let uartSCRReg   := SoCState.uartSCRReg state
+    let uartDLLReg   := SoCState.uartDLLReg state
+    let uartDLMReg   := SoCState.uartDLMReg state
+    -- Counter CSRs (116-117)
+    let mcounterenReg := SoCState.mcounterenReg state
+    let scounterenReg := SoCState.scounterenReg state
+    -- Divider state (118)
+    let divPending       := SoCState.divPending state
+    -- D-side TLB miss registers (119-121)
+    let dMissPC          := SoCState.dMissPC state
+    let dMissVaddr       := SoCState.dMissVaddr state
+    let dMissIsStore     := SoCState.dMissIsStore state
 
     -- Phase 1-5: identical to rv32iSoC except IMEM uses memoryWithInit
     -- WB-stage register-write enable (proven in Pipeline/RegfileTrapInv.lean).
@@ -530,15 +505,15 @@ def rv32iSoCBody {dom : DomainConfig}
     -- PTW memory address generation
     -- Sv32: L1 addr = {satpPPN[19:0], 12'd0} + {VPN1, 2'd0}
     --        L0 addr = {ptePPN[19:0], 12'd0} + {VPN0, 2'd0}
-    let satpPPN20 := satpReg[19,20]
+    let satpPPN20 := satpReg.map (BitVec.extractLsb' 0 20 ·)
     let satpPPNShifted := satpPPN20 ++ 0#12
-    let ptwVPN1 := ptwVaddrReg[31,10]
-    let ptwVPN0 := ptwVaddrReg[21,10]
+    let ptwVPN1 := ptwVaddrReg.map (BitVec.extractLsb' 22 10 ·)
+    let ptwVPN0 := ptwVaddrReg.map (BitVec.extractLsb' 12 10 ·)
     let ptwVPN1x4 := ptwVPN1 ++ 0#2
     let ptwVPN1Ext := 0#20 ++ ptwVPN1x4
     let l1Addr := satpPPNShifted + ptwVPN1Ext
-    let ptePPNFull := ptwPteReg[31,22]
-    let ptePPN20 := ptePPNFull[19,20]
+    let ptePPNFull := ptwPteReg.map (BitVec.extractLsb' 10 22 ·)
+    let ptePPN20 := ptePPNFull.map (BitVec.extractLsb' 0 20 ·)
     let ptePPNShifted := ptePPN20 ++ 0#12
     let ptwVPN0x4 := ptwVPN0 ++ 0#2
     let ptwVPN0Ext := 0#20 ++ ptwVPN0x4
@@ -546,7 +521,7 @@ def rv32iSoCBody {dom : DomainConfig}
     -- PTW mem-addr select + active flag (proven in MMU/PTWAddr.lean).
     let ptwMemAddr := Sparkle.IP.RV32.MMU.ptwMemAddrSignal ptwIsL1Req l1Addr l0Addr
     let ptwMemActive := Sparkle.IP.RV32.MMU.ptwMemActiveSignal ptwIsL1Req ptwIsL0Req
-    let ptwMemWordAddr := ptwMemAddr[24,23]
+    let ptwMemWordAddr := ptwMemAddr.map (BitVec.extractLsb' 2 23 ·)
     -- MMU stall: busy (not IDLE/DONE/FAULT) and not bypassed
     -- (proven in MMU/State.lean.)
     let mmuBusy := Sparkle.IP.RV32.MMU.mmuBusySignal isMMUIdle isMMUDone isMMUFault
@@ -556,8 +531,8 @@ def rv32iSoCBody {dom : DomainConfig}
     -- =========================================================================
     -- D-side TLB lookup (early, needed for effectiveAddr used by bus decode)
     -- =========================================================================
-    let dVPN := alu_result_approx[31,20]
-    let dPageOffset := alu_result_approx[11,12]
+    let dVPN := alu_result_approx.map (BitVec.extractLsb' 12 20 ·)
+    let dPageOffset := alu_result_approx.map (BitVec.extractLsb' 0 12 ·)
 
     -- D-side TLB hit-lookup (proven in MMU/TLB.lean): per-entry match
     -- iff valid && (mega ? VPN[19:10] match : full VPN match).
@@ -605,13 +580,14 @@ def rv32iSoCBody {dom : DomainConfig}
     let isUART_ex := Sparkle.IP.RV32.Bus.isUARTSignal effectiveAddr
     let isDMEM_ex := Sparkle.IP.RV32.Bus.isDMEMSignal isCLINT_ex is_mmio_ex isUART_ex
 
-    let dmem_write_addr := effectiveAddr[24,23]
-    let pendWriteWordAddr := pendingWriteAddr[24,23]
+    let dmem_write_addr := effectiveAddr.map (BitVec.extractLsb' 2 23 ·)
+    let pendWriteWordAddr := pendingWriteAddr.map (BitVec.extractLsb' 2 23 ·)
     -- DMEM read address: 3-way priority PTW > AMO > EX
     -- (proven in Bus/DMEMWriteMux.lean).
-    let dmem_read_addr := Sparkle.IP.RV32.Bus.dmemReadAddrSignal ptwMemActive pendingWriteEn
+    let dmem_read_addr :=
+      Sparkle.IP.RV32.Bus.dmemReadAddrSignal ptwMemActive pendingWriteEn
         ptwMemWordAddr pendWriteWordAddr
-        (effectiveAddr[24,23])
+        (effectiveAddr.map (BitVec.extractLsb' 2 23 ·))
     -- SC fail at EX: if SC and reservation invalid OR addr mismatch, suppress
     -- the memory write. The PA at EX time may be raw (if no MMU) or translated
     -- (effectiveAddr is the chosen one); use that for reservation match.
@@ -622,15 +598,15 @@ def rv32iSoCBody {dom : DomainConfig}
     let dmem_we := Sparkle.IP.RV32.AMO.dmemWeSignal idex_memWrite isDMEM_ex dTLBMiss scExFails
 
     -- Sub-word store: byte-enable logic based on funct3 and addr[1:0]
-    let storeByteOff := alu_result_approx[1,2]
+    let storeByteOff := alu_result_approx.map (BitVec.extractLsb' 0 2 ·)
     let storeByteOff0 := storeByteOff === 0#2
     let storeByteOff1 := storeByteOff === 1#2
     let storeByteOff2 := storeByteOff === 2#2
     let storeByteOff3 := storeByteOff === 3#2
-    let storeAddrBit1 := alu_result_approx[1,1]
+    let storeAddrBit1 := alu_result_approx.map (BitVec.extractLsb' 1 1 ·)
     let storeHalfLow := storeAddrBit1 === 0#1
     let storeHalfHigh := ~~~storeHalfLow
-    let storeFunct3Low := idex_funct3[1,2]
+    let storeFunct3Low := idex_funct3.map (BitVec.extractLsb' 0 2 ·)
     let isSB := storeFunct3Low === 0#2
     let isSH := storeFunct3Low === 1#2
     let isSW := storeFunct3Low === 2#2
@@ -647,11 +623,11 @@ def rv32iSoCBody {dom : DomainConfig}
     let byte3_we := Sparkle.IP.RV32.Bus.byteWeSignal dmem_we b3we
 
     -- Byte write data: position rs2 bytes for each byte lane
-    let rs2_byte0 := ex_rs2_approx[7,8]
-    let rs2_byte1 := ex_rs2_approx[15,8]
-    let rs2_byte2 := ex_rs2_approx[23,8]
-    let rs2_byte3 := ex_rs2_approx[31,8]
-    -- SB: all lanes get rs2[7:0]; SH lo/hi => 2 bytes; SW: each lane gets its byte
+    let rs2_byte0 := ex_rs2_approx.map (BitVec.extractLsb' 0 8 ·)
+    let rs2_byte1 := ex_rs2_approx.map (BitVec.extractLsb' 8 8 ·)
+    let rs2_byte2 := ex_rs2_approx.map (BitVec.extractLsb' 16 8 ·)
+    let rs2_byte3 := ex_rs2_approx.map (BitVec.extractLsb' 24 8 ·)
+    -- SB: all lanes get rs2[7:0]; SH: low/high half; SW: each lane gets its byte
     -- Routed through Bus.byte{0,1,2,3}WdataSignal (proofs in Bus/StoreData.lean).
     let byte0_wdata := Sparkle.IP.RV32.Bus.byte0WdataSignal rs2_byte0
     let byte1_wdata := Sparkle.IP.RV32.Bus.byte1WdataSignal isSB rs2_byte0 rs2_byte1
@@ -661,10 +637,10 @@ def rv32iSoCBody {dom : DomainConfig}
     -- Pending AMO write: registered data from previous WB stage AMO computation
     -- pendingWriteEn/Addr/Data are registers set when non-LR/SC AMO was in WB
     -- (pendWriteWordAddr already defined above for dmem_read_addr mux)
-    let pendByte0 := pendingWriteData[7,8]
-    let pendByte1 := pendingWriteData[15,8]
-    let pendByte2 := pendingWriteData[23,8]
-    let pendByte3 := pendingWriteData[31,8]
+    let pendByte0 := pendingWriteData.map (BitVec.extractLsb' 0 8 ·)
+    let pendByte1 := pendingWriteData.map (BitVec.extractLsb' 8 8 ·)
+    let pendByte2 := pendingWriteData.map (BitVec.extractLsb' 16 8 ·)
+    let pendByte3 := pendingWriteData.map (BitVec.extractLsb' 24 8 ·)
 
     -- Final DMEM write: mux between normal EX store and pending AMO write
     -- (proven in Bus/DMEMWriteMux.lean — pending-AMO priority).
@@ -686,10 +662,10 @@ def rv32iSoCBody {dom : DomainConfig}
     -- External DMEM write port muxing (for firmware/data loading during reset)
     -- External writes take priority over pipeline writes when dmemExtWriteEn=true
     -- (proven in Bus/DMEMWriteMux.lean — external-write priority).
-    let dmem_ext_byte0 := dmemExtWriteData[7,8]
-    let dmem_ext_byte1 := dmemExtWriteData[15,8]
-    let dmem_ext_byte2 := dmemExtWriteData[23,8]
-    let dmem_ext_byte3 := dmemExtWriteData[31,8]
+    let dmem_ext_byte0 := dmemExtWriteData.map (BitVec.extractLsb' 0 8 ·)
+    let dmem_ext_byte1 := dmemExtWriteData.map (BitVec.extractLsb' 8 8 ·)
+    let dmem_ext_byte2 := dmemExtWriteData.map (BitVec.extractLsb' 16 8 ·)
+    let dmem_ext_byte3 := dmemExtWriteData.map (BitVec.extractLsb' 24 8 ·)
     let actual_dmem_write_addr :=
       Sparkle.IP.RV32.Bus.actualDmemAddrSignal dmemExtWriteEn dmemExtWriteAddr final_dmem_write_addr
     let actual_byte0_wdata :=
@@ -736,20 +712,20 @@ def rv32iSoCBody {dom : DomainConfig}
     let early_ifetchPageFault :=
       Sparkle.IP.RV32.MMU.pageFaultGateSignal ifetchFaultPending bypassMMU
     -- Timer / software / S-mode interrupt enables (mirror lines 870..919)
-    let early_mstatusMIE := (mstatusReg[3,1]) === 1#1
-    let early_mstatusSIE := (mstatusReg[1,1]) === 1#1
-    let early_mieMTIE := (mieReg[7,1]) === 1#1
-    let early_mieMSIE := (mieReg[3,1]) === 1#1
+    let early_mstatusMIE := (mstatusReg.map (BitVec.extractLsb' 3 1 ·)) === 1#1
+    let early_mstatusSIE := (mstatusReg.map (BitVec.extractLsb' 1 1 ·)) === 1#1
+    let early_mieMTIE := (mieReg.map (BitVec.extractLsb' 7 1 ·)) === 1#1
+    let early_mieMSIE := (mieReg.map (BitVec.extractLsb' 3 1 ·)) === 1#1
     let early_privIsM := privMode === 3#2
     let early_privIsS := privMode === 1#2
     let early_privIsU := privMode === 0#2
-    let early_mTimerNotDeleg := ((midelegReg[7,1]) === 0#1)
-    let early_mSwNotDeleg := ((midelegReg[3,1]) === 0#1)
+    let early_mTimerNotDeleg := ((midelegReg.map (BitVec.extractLsb' 7 1 ·)) === 0#1)
+    let early_mSwNotDeleg := ((midelegReg.map (BitVec.extractLsb' 3 1 ·)) === 0#1)
     -- timerIrq computed early (same proof in CLINT/Timer.lean).
     let early_timerIrq :=
       Sparkle.IP.RV32.CLINT.timerIrqSignal
         mtimeLoReg mtimeHiReg mtimecmpLoReg mtimecmpHiReg
-    let early_swIrq := (msipReg[0,1]) === 1#1
+    let early_swIrq := (msipReg.map (BitVec.extractLsb' 0 1 ·)) === 1#1
     -- M-mode IRQ-enable predicates (proven in Trap/IRQEnable.lean)
     let early_timerIntEn :=
       Sparkle.IP.RV32.Trap.mTimerIntEnabledSignal
@@ -758,12 +734,12 @@ def rv32iSoCBody {dom : DomainConfig}
       Sparkle.IP.RV32.Trap.mSwIntEnabledSignal
         early_privIsM early_mstatusMIE early_mieMSIE early_swIrq early_mSwNotDeleg
     -- S-mode bit decoding from sip/sie
-    let early_stipPending := (mipSoftReg[5,1]) === 1#1
-    let early_ssipPending := (mipSoftReg[1,1]) === 1#1
-    let early_seipPending := (mipSoftReg[9,1]) === 1#1
-    let early_sieSTIE := (sieReg[5,1]) === 1#1
-    let early_sieSSIE := (sieReg[1,1]) === 1#1
-    let early_sieSEIE := (sieReg[9,1]) === 1#1
+    let early_stipPending := (mipSoftReg.map (BitVec.extractLsb' 5 1 ·)) === 1#1
+    let early_ssipPending := (mipSoftReg.map (BitVec.extractLsb' 1 1 ·)) === 1#1
+    let early_seipPending := (mipSoftReg.map (BitVec.extractLsb' 9 1 ·)) === 1#1
+    let early_sieSTIE := (sieReg.map (BitVec.extractLsb' 5 1 ·)) === 1#1
+    let early_sieSSIE := (sieReg.map (BitVec.extractLsb' 1 1 ·)) === 1#1
+    let early_sieSEIE := (sieReg.map (BitVec.extractLsb' 9 1 ·)) === 1#1
     -- S-mode IRQ-enable predicates (proven in Trap/IRQEnable.lean)
     let early_sTimerIntEn :=
       Sparkle.IP.RV32.Trap.sTimerIntEnabledSignal
@@ -829,7 +805,7 @@ def rv32iSoCBody {dom : DomainConfig}
     -- CLINT register decode (read side, proven in CLINT/Decode.lean).
     -- CLINT WB-stage offset matchers (proven in CLINT/Decode.lean):
     -- pairwise disjoint addresses.
-    let clintOffset_wb := exwb_physAddr[15,16]
+    let clintOffset_wb := exwb_physAddr.map (BitVec.extractLsb' 0 16 ·)
     let msipMatch_wb       := Sparkle.IP.RV32.CLINT.msipMatchSignal clintOffset_wb
     let mtimecmpLoMatch_wb := Sparkle.IP.RV32.CLINT.mtimecmpLoMatchSignal clintOffset_wb
     let mtimecmpHiMatch_wb := Sparkle.IP.RV32.CLINT.mtimecmpHiMatchSignal clintOffset_wb
@@ -844,7 +820,7 @@ def rv32iSoCBody {dom : DomainConfig}
     -- the EX-stage decoders (mutex + exhaustive).
     let isCLINT_wb := Sparkle.IP.RV32.Bus.isCLINTSignal exwb_physAddr
     let is_mmio_wb := Sparkle.IP.RV32.Bus.isMmioSignal exwb_physAddr
-    let mmioOffset_wb := exwb_physAddr[3,4]
+    let mmioOffset_wb := exwb_physAddr.map (BitVec.extractLsb' 0 4 ·)
     -- BitNet MMIO offset matchers (proven in MMIO/BitNet.lean).
     let mmioIsStatus_wb := Sparkle.IP.RV32.MMIO.mmioIsStatusSignal mmioOffset_wb
     let mmioIsOutput_wb := Sparkle.IP.RV32.MMIO.mmioIsOutputSignal mmioOffset_wb
@@ -853,14 +829,16 @@ def rv32iSoCBody {dom : DomainConfig}
     -- value read back from offset 0x8. Writes to offset 0x4 latch the
     -- input; BitNet settles in the same cycle; the following `lw`
     -- instruction sees the fresh result. See IP/RV32/BitNetPeripheral.lean.
-    let bitnetOut := Sparkle.IP.RV32.BitNetPeripheral.bitNetPeripheral aiInputReg
+    let bitnetOut :=
+      Sparkle.IP.RV32.BitNetPeripheral.bitNetPeripheral aiInputReg
     -- BitNet MMIO read mux (proven in MMIO/BitNet.lean).
-    let mmioRdata := Sparkle.IP.RV32.MMIO.mmioRdataSignal
+    let mmioRdata :=
+      Sparkle.IP.RV32.MMIO.mmioRdataSignal
         mmioIsStatus_wb mmioIsOutput_wb aiStatusReg bitnetOut
     -- UART 8250 read logic (proven in UART/ReadMux.lean): 7-way priority
     -- mux with DLAB-aware offset 0/1, plus IIR/LSR constants.
     let isUART_wb := Sparkle.IP.RV32.Bus.isUARTSignal exwb_physAddr
-    let uartOffset_wb := exwb_physAddr[2,3]
+    let uartOffset_wb := exwb_physAddr.map (BitVec.extractLsb' 0 3 ·)
     let uartDLAB_wb := Sparkle.IP.RV32.UART.uartDLABBitSignal uartLCRReg
     let uartRdata :=
       Sparkle.IP.RV32.UART.uartRdataSignal
@@ -874,13 +852,13 @@ def rv32iSoCBody {dom : DomainConfig}
         isCLINT_wb clintRdata isUART_wb uartRdata
         is_mmio_wb mmioRdata dmemRdataFwd
     -- Byte / half select (proven in Bus/LoadWidth.lean).
-    let loadByteOff := exwb_physAddr[1,2]
+    let loadByteOff := exwb_physAddr.map (BitVec.extractLsb' 0 2 ·)
     let loadByteOff0 := loadByteOff === 0#2
     let loadByteOff1 := loadByteOff === 1#2
     let loadByteOff2 := loadByteOff === 2#2
     let selByte :=
       Sparkle.IP.RV32.Bus.selByteSignal loadByteOff0 loadByteOff1 loadByteOff2 busRdataRaw
-    let loadAddrBit1 := exwb_physAddr[1,1]
+    let loadAddrBit1 := exwb_physAddr.map (BitVec.extractLsb' 1 1 ·)
     let isHalfLow := loadAddrBit1 === 0#1
     let selHalf := Sparkle.IP.RV32.Bus.selHalfSignal isHalfLow busRdataRaw
     -- Sign/zero extend byte and halfword (proven in Bus/LoadWidth.lean).
@@ -895,13 +873,15 @@ def rv32iSoCBody {dom : DomainConfig}
     let f3isLBU := exwb_funct3 === 4#3
     let f3isLHU := exwb_funct3 === 5#3
     -- 5-way load extractor (proven in Bus/LoadWidth.lean).
-    let loadExtracted := Sparkle.IP.RV32.Bus.loadExtractSignal
+    let loadExtracted :=
+      Sparkle.IP.RV32.Bus.loadExtractSignal
         f3isLB f3isLH f3isLBU f3isLHU
         byteSext byteZext halfSext halfZext busRdataRaw
     -- Gate: only use extracted value for DMEM loads; peripheral reads bypass sub-word extraction
     -- (proven in Bus/LoadWidth.lean).
     let isDMEM_wb := Sparkle.IP.RV32.Bus.isDMEMSignal isCLINT_wb is_mmio_wb isUART_wb
-    let busRdata :=  Sparkle.IP.RV32.Bus.busRdataGateSignal exwb_m2r isDMEM_wb loadExtracted busRdataRaw
+    let busRdata :=
+      Sparkle.IP.RV32.Bus.busRdataGateSignal exwb_m2r isDMEM_wb loadExtracted busRdataRaw
 
     -- A-ext WB stage: classify AMO type (proven in AMO/Decode.lean)
     let exwb_isLR := Sparkle.IP.RV32.AMO.isLRSignal exwb_isAMO exwb_amoOp
@@ -972,7 +952,7 @@ def rv32iSoCBody {dom : DomainConfig}
     let timerIrq :=
       Sparkle.IP.RV32.CLINT.timerIrqSignal
         mtimeLoReg mtimeHiReg mtimecmpLoReg mtimecmpHiReg
-    let swIrq := (msipReg[0,1]) === 1#1
+    let swIrq := (msipReg.map (BitVec.extractLsb' 0 1 ·)) === 1#1
     -- mip read value (proven in CSR/MIP.lean):
     -- combines MTIP=bit7 (from timerIrq), MSIP=bit3 (from swIrq), and the
     -- software-writable S-bits {SSIP=1, STIP=5, SEIP=9} from mipSoftReg.
@@ -1041,19 +1021,19 @@ def rv32iSoCBody {dom : DomainConfig}
         mtimeLoReg mtimeHiReg
 
     -- Interrupt enable flags
-    let mstatusMIE_flag := (mstatusReg[3,1]) === 1#1
-    let mstatusMPIE_flag := (mstatusReg[7,1]) === 1#1
-    let mstatusSIE_flag := (mstatusReg[1,1]) === 1#1
-    let mstatusSPIE_flag := (mstatusReg[5,1]) === 1#1
-    let mieMTIE_flag := (mieReg[7,1]) === 1#1
-    let mieMSIE_flag := (mieReg[3,1]) === 1#1
+    let mstatusMIE_flag := (mstatusReg.map (BitVec.extractLsb' 3 1 ·)) === 1#1
+    let mstatusMPIE_flag := (mstatusReg.map (BitVec.extractLsb' 7 1 ·)) === 1#1
+    let mstatusSIE_flag := (mstatusReg.map (BitVec.extractLsb' 1 1 ·)) === 1#1
+    let mstatusSPIE_flag := (mstatusReg.map (BitVec.extractLsb' 5 1 ·)) === 1#1
+    let mieMTIE_flag := (mieReg.map (BitVec.extractLsb' 7 1 ·)) === 1#1
+    let mieMSIE_flag := (mieReg.map (BitVec.extractLsb' 3 1 ·)) === 1#1
     -- M-mode interrupt fires when: (priv==M && mstatus.MIE && mie.bit && pending),
     -- OR when priv<M && mie.bit && pending (regardless of mstatus.MIE), provided
     -- the interrupt is NOT delegated to S-mode (mideleg bit clear). If delegated,
     -- it's handled in S-mode by the S-mode interrupt path below.
     let privIsM_pre := privMode === 3#2
-    let mTimerNotDelegated := ((midelegReg[7,1]) === 0#1)
-    let mSwNotDelegated := ((midelegReg[3,1]) === 0#1)
+    let mTimerNotDelegated := ((midelegReg.map (BitVec.extractLsb' 7 1 ·)) === 0#1)
+    let mSwNotDelegated := ((midelegReg.map (BitVec.extractLsb' 3 1 ·)) === 0#1)
     -- M-mode IRQ-enable predicates (proven in Trap/IRQEnable.lean).
     -- Spec: fires iff ((priv=M ∧ MIE) ∨ priv<M) ∧ mie.bit ∧ pending ∧ ¬delegated.
     let timerIntEnabled :=
@@ -1065,12 +1045,12 @@ def rv32iSoCBody {dom : DomainConfig}
     -- S-mode bit decoding from sip/sie + privilege flags
     let privIsU0 := privMode === 0#2
     let privIsS0 := privMode === 1#2
-    let stipPending := (mipSoftReg[5,1]) === 1#1
-    let ssipPending := (mipSoftReg[1,1]) === 1#1
-    let seipPending := (mipSoftReg[9,1]) === 1#1
-    let sieSTIE_flag := (sieReg[5,1]) === 1#1
-    let sieSSIE_flag := (sieReg[1,1]) === 1#1
-    let sieSEIE_flag := (sieReg[9,1]) === 1#1
+    let stipPending := (mipSoftReg.map (BitVec.extractLsb' 5 1 ·)) === 1#1
+    let ssipPending := (mipSoftReg.map (BitVec.extractLsb' 1 1 ·)) === 1#1
+    let seipPending := (mipSoftReg.map (BitVec.extractLsb' 9 1 ·)) === 1#1
+    let sieSTIE_flag := (sieReg.map (BitVec.extractLsb' 5 1 ·)) === 1#1
+    let sieSSIE_flag := (sieReg.map (BitVec.extractLsb' 1 1 ·)) === 1#1
+    let sieSEIE_flag := (sieReg.map (BitVec.extractLsb' 9 1 ·)) === 1#1
     -- S-mode IRQ-enable predicates (proven in Trap/IRQEnable.lean).
     -- Spec: fires iff ((priv=S ∧ SIE) ∨ priv=U) ∧ sie.bit ∧ mip.soft.bit.
     -- Delegation is enforced separately in Trap/Delegation.lean.
@@ -1184,12 +1164,12 @@ def rv32iSoCBody {dom : DomainConfig}
     let alu_result :=
       Sparkle.IP.RV32.Pipeline.aluResultSignal idex_isMext mextResult alu_result_raw
 
-    let id_opcode := ifid_inst[6,7]
-    let id_rd     := ifid_inst[11,5]
-    let id_funct3 := ifid_inst[14,3]
-    let id_rs1    := ifid_inst[19,5]
-    let id_rs2    := ifid_inst[24,5]
-    let id_funct7 := ifid_inst[31,7]
+    let id_opcode := ifid_inst.map (BitVec.extractLsb' 0 7 ·)
+    let id_rd     := ifid_inst.map (BitVec.extractLsb' 7 5 ·)
+    let id_funct3 := ifid_inst.map (BitVec.extractLsb' 12 3 ·)
+    let id_rs1    := ifid_inst.map (BitVec.extractLsb' 15 5 ·)
+    let id_rs2    := ifid_inst.map (BitVec.extractLsb' 20 5 ·)
+    let id_funct7 := ifid_inst.map (BitVec.extractLsb' 25 7 ·)
     let id_imm := immGenSignal ifid_inst id_opcode
     let id_aluOp := aluControlSignal id_opcode id_funct3 id_funct7
     -- Opcode predicates (proven in Decoder/Opcode.lean): pairwise mutex.
@@ -1219,7 +1199,7 @@ def rv32iSoCBody {dom : DomainConfig}
     -- SYSTEM-opcode decoders (proven in Decoder/System.lean):
     -- ECALL=0x000, MRET=0x302, SRET=0x102 in funct12; SFENCE.VMA via funct7=0x09;
     -- M-extension via R-type + funct7=0x01.
-    let id_csrAddr := ifid_inst[31,12]
+    let id_csrAddr := ifid_inst.map (BitVec.extractLsb' 20 12 ·)
     let id_isEcall :=
       Sparkle.IP.RV32.Decoder.isEcallSignal id_isSystem f3isZero id_csrAddr
     let id_isMret :=
@@ -1256,7 +1236,8 @@ def rv32iSoCBody {dom : DomainConfig}
     -- =========================================================================
     -- I-side TLB lookup (shared TLB entries, for instruction fetch translation)
     -- =========================================================================
-    let iVPN := fetchPC[31,20]
+    let iVPN := fetchPC.map (BitVec.extractLsb' 12 20 ·)
+
     -- iTLB hit logic (reuses MMU/TLB.lean — same shape as D-side).
     let itlb0Hit := Sparkle.IP.RV32.MMU.tlbHitSignal tlb0Valid tlb0Mega tlb0VPN iVPN
     let itlb1Hit := Sparkle.IP.RV32.MMU.tlbHitSignal tlb1Valid tlb1Mega tlb1VPN iVPN
@@ -1305,10 +1286,10 @@ def rv32iSoCBody {dom : DomainConfig}
     -- stall holds the id_rs latched address; else take from ifid_inst.
     let rf_rs1_addr :=
       Sparkle.IP.RV32.Pipeline.rfRsAddrSignal stall id_rs1
-        (ifid_inst[19,5])
+        (ifid_inst.map (BitVec.extractLsb' 15 5 ·))
     let rf_rs2_addr :=
       Sparkle.IP.RV32.Pipeline.rfRsAddrSignal stall id_rs2
-        (ifid_inst[24,5])
+        (ifid_inst.map (BitVec.extractLsb' 20 5 ·))
     -- Register file uses combinational reads (same-cycle readAddr)
     -- so that rf_rs1_raw.val t reads the register addressed by rf_rs1_addr.val t,
     -- not rf_rs1_addr.val (t-1) as Signal.memory would.
@@ -1411,7 +1392,7 @@ def rv32iSoCBody {dom : DomainConfig}
       Sparkle.IP.RV32.Pipeline.squashSignal
         stallAndNotFreeze flushOrDelay stallDelay
 
-    let clintOffset := alu_result_approx[15,16]
+    let clintOffset := alu_result_approx.map (BitVec.extractLsb' 0 16 ·)
     let clintWE :=
       Sparkle.IP.RV32.Bus.peripheralWESignal idex_memWrite isCLINT_ex validEX
     -- CLINT EX-stage offset matchers (proven in CLINT/Decode.lean).
@@ -1446,7 +1427,7 @@ def rv32iSoCBody {dom : DomainConfig}
 
     let mmioWE :=
       Sparkle.IP.RV32.Bus.peripheralWESignal idex_memWrite is_mmio_ex validEX
-    let mmioOffset_ex := alu_result_approx[3,4]
+    let mmioOffset_ex := alu_result_approx.map (BitVec.extractLsb' 0 4 ·)
     let mmioIsStatus_ex := Sparkle.IP.RV32.MMIO.mmioIsStatusSignal mmioOffset_ex
     let mmioIsInput_ex  := Sparkle.IP.RV32.MMIO.mmioIsInputSignal mmioOffset_ex
     -- BitNet MMIO write commits (proven in MMIO/BitNet.lean).
@@ -1458,10 +1439,10 @@ def rv32iSoCBody {dom : DomainConfig}
     -- UART 8250 write logic (EX stage)
     let uartWE :=
       Sparkle.IP.RV32.Bus.peripheralWESignal idex_memWrite isUART_ex validEX
-    let uartOffset_ex := alu_result_approx[2,3]
+    let uartOffset_ex := alu_result_approx.map (BitVec.extractLsb' 0 3 ·)
     -- UART DLAB bit + data (proven in UART/Decode.lean).
     let uartDLAB := Sparkle.IP.RV32.UART.uartDLABBitSignal uartLCRReg
-    let uartWdata8 := ex_rs2_approx[7,8]
+    let uartWdata8 := ex_rs2_approx.map (BitVec.extractLsb' 0 8 ·)
     -- Per-register write predicates (proven in UART/Decode.lean):
     -- DLAB-aware for offsets 0 (DLL/RBR) and 1 (DLM/IER).
     let uartLCRWE := Sparkle.IP.RV32.UART.uartWriteLCRSignal uartWE uartOffset_ex
@@ -1578,7 +1559,6 @@ def rv32iSoCBody {dom : DomainConfig}
     --      suppressEXWB and never committed. mepc = idex_pc so it re-runs.
     --  (b) IDEX has been squashed (e.g., post-mret transition cycle), so
     --      idex_pc may point into stale (M-mode) territory. In that case,
-    --      use pcReg (the redirected next-fetch PC) as mepc.
     --      use pcReg (the redirected next-fetch PC) as mepc.
     -- We detect "IDEX has a valid live instruction" by checking the OR of the
     -- isAsyncInt: any of the 5 interrupts fires (proven in Trap/TrapTaken.lean).
@@ -1740,7 +1720,7 @@ def rv32iSoCBody {dom : DomainConfig}
 
     -- TLB fill on PTW completion
     let tlbFill := ptwIsDone
-    let fillVPN := ptwVaddrReg[31,20]
+    let fillVPN := ptwVaddrReg.map (BitVec.extractLsb' 12 20 ·)
 
     -- Replacement pointer: which entry to fill
     -- TLB fill predicates (proven in MMU/Fill.lean): pairwise mutex
@@ -1839,104 +1819,112 @@ def rv32iSoCBody {dom : DomainConfig}
     let dMissIsStoreNext :=
       Sparkle.IP.RV32.MMU.dMissCaptureBoolSignal dTLBMiss idex_memWrite dMissIsStore
 
-    -- =========================================================================
-    -- Named register outputs (binding name becomes the _gen_<name> wire in JIT)
-    -- =========================================================================
-    let pcRegOut      := Signal.register 0#32 pcNext
-    let fetchPCOut    := Signal.register 0#32 fetchPCIn
-    let flushDelayOut := Signal.register false flush
-    let ifid_instOut  := Signal.register 0x00000013#32 ifid_inst_in
-    let ifid_pcOut    := Signal.register 0#32 ifid_pc_in
-    let ifid_pc4Out   := Signal.register 0#32 ifid_pc4_in
-
-    -- Helper aliases for repeated IDEX register patterns
-    let idexSqBool (cur nxt : _) :=
-      Sparkle.IP.RV32.Pipeline.idexSquashableBoolSignal freezeIDEX squash cur nxt
-    let idexSqBV (cur nxt zero : _) :=
-      Sparkle.IP.RV32.Pipeline.idexSquashableBVSignal freezeIDEX squash cur zero nxt
-    let idexHoldBool (cur nxt : _) :=
-      Sparkle.IP.RV32.Pipeline.idexHoldableBoolSignal freezeIDEX cur nxt
-    let idexHoldBV (cur nxt : _) :=
-      Sparkle.IP.RV32.Pipeline.idexHoldableBVSignal freezeIDEX cur nxt
-    let exwbSuppBool (cur : _) :=
-      Sparkle.IP.RV32.Pipeline.exwbSuppressBoolSignal suppressEXWB cur
-    let exwbSuppBV (zero cur : _) :=
-      Sparkle.IP.RV32.Pipeline.exwbSuppressBVSignal suppressEXWB zero cur
-
-    -- =========================================================================
-    -- Assemble next-state: pack back into grouped SoCState
-    -- =========================================================================
-    let pipeNext : Signal dom PipelineState := bundleAll! [
-      pcRegOut,                                                       -- pcReg
-      fetchPCOut,                                                     -- fetchPC
-      flushDelayOut,                                                  -- flushDelay
-      ifid_instOut,                                                   -- ifid_inst
-      ifid_pcOut,                                                     -- ifid_pc
-      ifid_pc4Out,                                                    -- ifid_pc4
-      -- ID/EX control (squashable: freeze > squash > new)
-      Signal.register 0#4   (idexSqBV  idex_aluOp    0#4  id_aluOp),
-      Signal.register false (idexSqBool idex_regWrite      id_regWrite),
-      Signal.register false (idexSqBool idex_memRead       id_memRead),
-      Signal.register false (idexSqBool idex_memWrite      id_memWrite),
-      Signal.register false (idexSqBool idex_memToReg      id_memToReg),
-      Signal.register false (idexSqBool idex_branch        id_isBranch),
-      Signal.register false (idexSqBool idex_jump          id_jump),
-      Signal.register false (idexSqBool idex_auipc         id_auipc),
-      Signal.register false (idexSqBool idex_aluSrcB       id_aluSrcB),
-      Signal.register false (idexSqBool idex_isJalr        id_isJALR),
-      Signal.register false (idexSqBool idex_isCsr         id_isCsr),
-      Signal.register false (idexSqBool idex_isEcall       id_isEcall),
-      Signal.register false (idexSqBool idex_isMret        id_isMret),
-      -- ID/EX data (holdable: freeze > new)
-      Signal.register 0#32  (idexHoldBV  idex_rs1Val  id_rs1Val),
-      Signal.register 0#32  (idexHoldBV  idex_rs2Val  id_rs2Val),
-      Signal.register 0#32  (idexHoldBV  idex_imm     id_imm),
-      Signal.register 0#5   (idexSqBV    idex_rd      0#5 id_rd),
-      Signal.register 0#5   (idexHoldBV  idex_rs1Idx  id_rs1),
-      Signal.register 0#5   (idexHoldBV  idex_rs2Idx  id_rs2),
-      Signal.register 0#3   (idexHoldBV  idex_funct3  id_funct3),
-      Signal.register 0#32  (idexHoldBV  idex_pc      ifid_pc),
-      Signal.register 0#32  (idexHoldBV  idex_pc4     ifid_pc4),
-      Signal.register 0#12  (idexHoldBV  idex_csrAddr   id_csrAddr),
-      Signal.register 0#3   (idexHoldBV  idex_csrFunct3 id_funct3),
-      -- EX/WB latch
-      Signal.register 0#32  (idexHoldBV  exwb_alu      alu_result),
-      Signal.register 0#32  (idexHoldBV  exwb_physAddr effectiveAddr),
-      Signal.register 0#5   (exwbSuppBV  0#5           idex_rd),
-      Signal.register false (exwbSuppBool idex_regWrite),
-      Signal.register false (exwbSuppBool idex_memToReg),
-      Signal.register 0#32  (idexHoldBV  exwb_pc4     idex_pc4),
-      Signal.register false (exwbSuppBool idex_jump),
-      Signal.register false (exwbSuppBool idex_isCsr),
-      Signal.register 0#32  (idexHoldBV  exwb_csrRdata csr_rdata),
-      -- WB-forwarding shadow
-      Signal.register 0#5   wb_addr,
-      Signal.register 0#32  wb_data,
-      Signal.register false wb_en,
-      -- Store-history shadow
+    -- Demonstrate named-register-output: instead of inlining the
+    -- Signal.register call inside bundleAll!, bind it to a let so
+    -- the elab attaches the binding's name as a wire-name hint. The
+    -- generated Verilog/JIT then has `_gen_<bindingName>` as a
+    -- struct field instead of an anonymous `_tmp_a_NNNN`. This
+    -- makes downstream probes/observability much easier (no
+    -- SoCOutput.wireNames hand-listing required).
+    let pcRegOut       := Signal.register 0#32 pcNext
+    let fetchPCOut     := Signal.register 0#32 fetchPCIn
+    let flushDelayOut  := Signal.register false flush
+    let ifid_instOut   := Signal.register 0x00000013#32 ifid_inst_in
+    let ifid_pcOut     := Signal.register 0#32 ifid_pc_in
+    let ifid_pc4Out    := Signal.register 0#32 ifid_pc4_in
+    bundleAll! [
+      pcRegOut,                                                              -- 0: pcReg
+      fetchPCOut,                                                            -- 1: fetchPC
+      flushDelayOut,                                                         -- 2: flushDelay
+      ifid_instOut,                                                          -- 3: ifid_inst
+      ifid_pcOut,                                                            -- 4: ifid_pc
+      ifid_pc4Out,                                                           -- 5: ifid_pc4
+      -- ID/EX (freezeIDEX freeze: hold current when freezeIDEX, else squash or pass)
+      -- IDEX-stage register inputs (proven in Pipeline/IDEXRegInput.lean):
+      -- squashable fields: freezeIDEX > squash > new ; holdable: freezeIDEX > new.
+      Signal.register 0#4
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBVSignal freezeIDEX squash idex_aluOp 0#4 id_aluOp),       -- 6
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBoolSignal freezeIDEX squash idex_regWrite id_regWrite),
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBoolSignal freezeIDEX squash idex_memRead id_memRead),
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBoolSignal freezeIDEX squash idex_memWrite id_memWrite),
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBoolSignal freezeIDEX squash idex_memToReg id_memToReg),
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBoolSignal freezeIDEX squash idex_branch id_isBranch),
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBoolSignal freezeIDEX squash idex_jump id_jump),
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBoolSignal freezeIDEX squash idex_auipc id_auipc),
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBoolSignal freezeIDEX squash idex_aluSrcB id_aluSrcB),
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBoolSignal freezeIDEX squash idex_isJalr id_isJALR),
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBoolSignal freezeIDEX squash idex_isCsr id_isCsr),
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBoolSignal freezeIDEX squash idex_isEcall id_isEcall),
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBoolSignal freezeIDEX squash idex_isMret id_isMret),
       Signal.register 0#32
-        (Sparkle.IP.RV32.Pipeline.prevStoreAddrSignal useTranslatedAddr dPhysAddr alu_result),
-      Signal.register 0#32  ex_rs2,
-      Signal.register false (exwbSuppBool idex_memWrite),
-      -- Sub-word / M-ext pipeline fields
-      Signal.register 0#3   (idexHoldBV  exwb_funct3 idex_funct3),
-      Signal.register false (idexSqBool  idex_isMext id_isMext),
-      -- S-mode pipeline additions
-      Signal.register false (idexSqBool idex_isSret      id_isSret),
-      Signal.register false (idexSqBool idex_isSFenceVMA id_isSFenceVMA),
-      -- Stall-delay register
-      Signal.register false ifetchStall
-    ]
-
-    let clintNext : Signal dom CLINTState := bundleAll! [
-      Signal.register 0#32          msipNext,
-      Signal.register 0#32          mtimeLoNext,
-      Signal.register 0#32          mtimeHiNext,
+        (Sparkle.IP.RV32.Pipeline.idexHoldableBVSignal freezeIDEX idex_rs1Val id_rs1Val),       -- 19
+      Signal.register 0#32
+        (Sparkle.IP.RV32.Pipeline.idexHoldableBVSignal freezeIDEX idex_rs2Val id_rs2Val),       -- 20
+      Signal.register 0#32
+        (Sparkle.IP.RV32.Pipeline.idexHoldableBVSignal freezeIDEX idex_imm id_imm),             -- 21
+      Signal.register 0#5
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBVSignal freezeIDEX squash idex_rd 0#5 id_rd),
+      Signal.register 0#5
+        (Sparkle.IP.RV32.Pipeline.idexHoldableBVSignal freezeIDEX idex_rs1Idx id_rs1),
+      Signal.register 0#5
+        (Sparkle.IP.RV32.Pipeline.idexHoldableBVSignal freezeIDEX idex_rs2Idx id_rs2),
+      Signal.register 0#3
+        (Sparkle.IP.RV32.Pipeline.idexHoldableBVSignal freezeIDEX idex_funct3 id_funct3),
+      Signal.register 0#32
+        (Sparkle.IP.RV32.Pipeline.idexHoldableBVSignal freezeIDEX idex_pc ifid_pc),
+      Signal.register 0#32
+        (Sparkle.IP.RV32.Pipeline.idexHoldableBVSignal freezeIDEX idex_pc4 ifid_pc4),
+      Signal.register 0#12
+        (Sparkle.IP.RV32.Pipeline.idexHoldableBVSignal freezeIDEX idex_csrAddr id_csrAddr),
+      Signal.register 0#3
+        (Sparkle.IP.RV32.Pipeline.idexHoldableBVSignal freezeIDEX idex_csrFunct3 id_funct3),
+      -- EX/WB (suppress side-effects during suppressEXWB = dTLBMiss | holdEX,
+      -- freeze data during freezeIDEX) — proven in Pipeline/IDEXRegInput.lean.
+      -- Data fields use idexHoldable (freezeIDEX > new); side-effect bits use
+      -- exwbSuppress (suppress > new).
+      Signal.register 0#32
+        (Sparkle.IP.RV32.Pipeline.idexHoldableBVSignal freezeIDEX exwb_alu alu_result),          -- 30: exwb_alu
+      Signal.register 0#32
+        (Sparkle.IP.RV32.Pipeline.idexHoldableBVSignal freezeIDEX exwb_physAddr effectiveAddr),  -- 31: exwb_physAddr
+      Signal.register 0#5
+        (Sparkle.IP.RV32.Pipeline.exwbSuppressBVSignal suppressEXWB 0#5 idex_rd),                 -- 32: exwb_rd
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.exwbSuppressBoolSignal suppressEXWB idex_regWrite),             -- 33: exwb_regW
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.exwbSuppressBoolSignal suppressEXWB idex_memToReg),             -- 34: exwb_m2r
+      Signal.register 0#32
+        (Sparkle.IP.RV32.Pipeline.idexHoldableBVSignal freezeIDEX exwb_pc4 idex_pc4),             -- 35: exwb_pc4
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.exwbSuppressBoolSignal suppressEXWB idex_jump),                 -- 36: exwb_jump
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.exwbSuppressBoolSignal suppressEXWB idex_isCsr),                -- 37: exwb_isCsr
+      Signal.register 0#32
+        (Sparkle.IP.RV32.Pipeline.idexHoldableBVSignal freezeIDEX exwb_csrRdata csr_rdata),       -- 38: exwb_csrRdata
+      Signal.register 0#5 wb_addr,                                          -- 39: prev_wb_addr
+      Signal.register 0#32 wb_data,                                         -- 40: prev_wb_data
+      Signal.register false wb_en,                                           -- 41: prev_wb_en
+      Signal.register 0#32
+        (Sparkle.IP.RV32.Pipeline.prevStoreAddrSignal useTranslatedAddr dPhysAddr alu_result),    -- 42: prevStoreAddr (use phys)
+      Signal.register 0#32 ex_rs2,                                          -- 43: prevStoreData
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.exwbSuppressBoolSignal suppressEXWB idex_memWrite),             -- 44: prevStoreEn
+      Signal.register 0#32 msipNext,                                        -- 45
+      Signal.register 0#32 mtimeLoNext,
+      Signal.register 0#32 mtimeHiNext,
       Signal.register 0xFFFFFFFF#32 mtimecmpLoNext,
-      Signal.register 0xFFFFFFFF#32 mtimecmpHiNext
-    ]
-
-    let csrmNext : Signal dom CSRMState := bundleAll! [
+      Signal.register 0xFFFFFFFF#32 mtimecmpHiNext,
       Signal.register 0#32 mstatusNext,
       Signal.register 0#32 mieNext,
       Signal.register 0#32 mtvecNext,
@@ -1944,11 +1932,29 @@ def rv32iSoCBody {dom : DomainConfig}
       Signal.register 0#32 mepcNext,
       Signal.register 0#32 mcauseNext,
       Signal.register 0#32 mtvalNext,
-      Signal.register 0#32 mipSoftNext
-    ]
-
-    let smodeNext : Signal dom SModeCsrState := bundleAll! [
-      Signal.register 3#2  privModeNext,
+      Signal.register 0#32 aiStatusNext,
+      Signal.register 0#32 aiInputNext,
+      -- Sub-word + M-ext (holdEX aware)
+      Signal.register 0#3
+        (Sparkle.IP.RV32.Pipeline.idexHoldableBVSignal freezeIDEX exwb_funct3 idex_funct3),       -- 59: exwb_funct3
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBoolSignal freezeIDEX squash idex_isMext id_isMext),  -- 60
+      -- A-ext registers (61-69)
+      Signal.register false resValidNext,
+      Signal.register 0#32 resAddrNext,
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBoolSignal freezeIDEX squash idex_isAMO id_isAMO),
+      Signal.register 0#5
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBVSignal freezeIDEX squash idex_amoOp 0#5 id_amoOp),
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.exwbSuppressBoolSignal suppressEXWB idex_isAMO),                -- exwb_isAMO
+      Signal.register 0#5
+        (Sparkle.IP.RV32.Pipeline.idexHoldableBVSignal freezeIDEX exwb_amoOp idex_amoOp),         -- exwb_amoOp
+      Signal.register false pendingWriteEnNext,
+      Signal.register 0#32 pendingWriteAddrNext,
+      Signal.register 0#32 pendingWriteDataNext,
+      -- S-mode CSRs + privilege (70-79)
+      Signal.register 3#2 privModeNext,
       Signal.register 0#32 sieNext,
       Signal.register 0#32 stvecNext,
       Signal.register 0#32 sscratchNext,
@@ -1958,90 +1964,66 @@ def rv32iSoCBody {dom : DomainConfig}
       Signal.register 0#32 satpNext,
       Signal.register 0#32 medelegNext,
       Signal.register 0#32 midelegNext,
-      Signal.register 0#32 mcounterenNext,
-      Signal.register 0#32 scounterenNext
-    ]
-
-    let aextNext : Signal dom AExtState := bundleAll! [
-      Signal.register false resValidNext,
-      Signal.register 0#32  resAddrNext,
-      Signal.register false (idexSqBool idex_isAMO id_isAMO),
-      Signal.register 0#5   (idexSqBV   idex_amoOp 0#5 id_amoOp),
-      Signal.register false (exwbSuppBool idex_isAMO),
-      Signal.register 0#5   (idexHoldBV  exwb_amoOp idex_amoOp),
-      Signal.register false pendingWriteEnNext,
-      Signal.register 0#32  pendingWriteAddrNext,
-      Signal.register 0#32  pendingWriteDataNext
-    ]
-
-    let mmuNext : Signal dom MMUState := bundleAll! [
-      Signal.register 0#3  mmuStateNext,
-      Signal.register 0#3  ptwStateNext,
+      -- MMU TLB + PTW (80-107)
+      Signal.register 0#3 mmuStateNext,
+      Signal.register 0#3 ptwStateNext,
       Signal.register 0#32 ptwVaddrNext,
       Signal.register 0#32 ptwPteNext,
       Signal.register false ptwMegaNext,
-      Signal.register 0#2  replPtrNext,
-      -- TLB entry 0
+      Signal.register 0#2 replPtrNext,
       Signal.register false tlb0ValidNext,
-      Signal.register 0#20  tlb0VPNNext,
-      Signal.register 0#22  tlb0PPNNext,
-      Signal.register 0#8   tlb0FlagsNext,
+      Signal.register 0#20 tlb0VPNNext,
+      Signal.register 0#22 tlb0PPNNext,
+      Signal.register 0#8 tlb0FlagsNext,
       Signal.register false tlb0MegaNext,
-      -- TLB entry 1
       Signal.register false tlb1ValidNext,
-      Signal.register 0#20  tlb1VPNNext,
-      Signal.register 0#22  tlb1PPNNext,
-      Signal.register 0#8   tlb1FlagsNext,
+      Signal.register 0#20 tlb1VPNNext,
+      Signal.register 0#22 tlb1PPNNext,
+      Signal.register 0#8 tlb1FlagsNext,
       Signal.register false tlb1MegaNext,
-      -- TLB entry 2
       Signal.register false tlb2ValidNext,
-      Signal.register 0#20  tlb2VPNNext,
-      Signal.register 0#22  tlb2PPNNext,
-      Signal.register 0#8   tlb2FlagsNext,
+      Signal.register 0#20 tlb2VPNNext,
+      Signal.register 0#22 tlb2PPNNext,
+      Signal.register 0#8 tlb2FlagsNext,
       Signal.register false tlb2MegaNext,
-      -- TLB entry 3
       Signal.register false tlb3ValidNext,
-      Signal.register 0#20  tlb3VPNNext,
-      Signal.register 0#22  tlb3PPNNext,
-      Signal.register 0#8   tlb3FlagsNext,
+      Signal.register 0#20 tlb3VPNNext,
+      Signal.register 0#22 tlb3PPNNext,
+      Signal.register 0#8 tlb3FlagsNext,
       Signal.register false tlb3MegaNext,
-      -- I-fetch fault tracking
       Signal.register false ptwIsIfetchNext,
       Signal.register false ifetchFaultPendingNext,
-      -- D-side TLB miss latches
-      Signal.register 0#32  dMissPCNext,
-      Signal.register 0#32  dMissVaddrNext,
-      Signal.register false dMissIsStoreNext
-    ]
-
-    let uartNext : Signal dom UARTState := bundleAll! [
+      -- Pipeline additions (108-109)
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBoolSignal freezeIDEX squash idex_isSret id_isSret),
+      Signal.register false
+        (Sparkle.IP.RV32.Pipeline.idexSquashableBoolSignal freezeIDEX squash idex_isSFenceVMA id_isSFenceVMA),
+      -- UART 8250 registers (110-115)
       Signal.register 0#8 uartLCRNext,
       Signal.register 0#8 uartIERNext,
       Signal.register 0#8 uartMCRNext,
       Signal.register 0#8 uartSCRNext,
       Signal.register 0#8 uartDLLNext,
-      Signal.register 0#8 uartDLMNext
-    ]
-
-    bundleAll! [
-      pipeNext,
-      clintNext,
-      csrmNext,
-      smodeNext,
-      aextNext,
-      mmuNext,
-      uartNext,
-      Signal.register 0#32 aiStatusNext,
-      Signal.register 0#32 aiInputNext,
-      Signal.register false divPendingNext
+      Signal.register 0#8 uartDLMNext,
+      -- Counter CSRs (116-117)
+      Signal.register 0#32 mcounterenNext,
+      Signal.register 0#32 scounterenNext,
+      -- Divider pending (118)
+      Signal.register false divPendingNext,
+      -- D-side TLB miss registers (119-121)
+      Signal.register 0#32 dMissPCNext,
+      Signal.register 0#32 dMissVaddrNext,
+      Signal.register false dMissIsStoreNext,
+      Signal.register false ifetchStall,  -- stallDelay (kept stable; new state below)
+      Signal.register 0#32 mipSoftNext     -- mipSoftReg (123): SW-writable mip bits
     ]
 
 /-- Backward-compatible wrapper using firmware function for IMEM read. -/
 private def rv32iSoCWithFirmwareBody {dom : DomainConfig}
     (firmware : BitVec 12 → BitVec 32)
     (state : Signal dom SoCState) : Signal dom SoCState :=
-  let fetchPC := PipelineState.fetchPC (SoCState.pipe state)
-  let imem_addr := fetchPC[13,12]
+  let fetchPC := SoCState.fetchPC state
+  let imem_addr := fetchPC.map (BitVec.extractLsb' 2 12 ·)
   let imem_rdata := imem_addr.map firmware
   rv32iSoCBody imem_rdata (state := state)
 
@@ -2065,7 +2047,9 @@ def rv32iSoCSimulate {dom : DomainConfig}
   return Signal.fst soc
 
 /-- RV32I SoC simulation returning full state tuple.
-    Allows extracting PC, store signals, CSRs, etc. for verification. -/
+    Allows extracting PC, store signals, CSRs, etc. for verification.
+    State indices: 0=PC, 42=storeAddr, 43=storeData, 44=storeEn
+    122 registers total (incl. S-mode, MMU, trap delegation, UART 8250, counter CSRs, divider). -/
 def rv32iSoCSimulateFull {dom : DomainConfig}
     (firmware : BitVec 12 → BitVec 32)
     : IO (Signal dom SoCState) := do
@@ -2214,4 +2198,4 @@ def rv32iSoCJITRun
   JIT.run handle cycles wireIndices callback
   JIT.destroy handle
 
-end Sparkle.IP.RV32.SoC
+end Sparkle.IP.RV32.SoCorg
