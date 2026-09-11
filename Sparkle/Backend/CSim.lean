@@ -2111,6 +2111,20 @@ def emitModule (m : Module) (design : Option Design := none)
         String.intercalate "\n" evalTickTickBody ++ "\n") ++
       "}\n\n"
 
+    -- A statement-level combinational cycle (e.g. a bidirectional mesh:
+    -- cell A reads B's output wire and B reads A's) cannot be evaluated in
+    -- one sequential pass: the fused body above would read the back-edge
+    -- wire before it is written (an uninitialised stack local).  `eval`
+    -- relaxes such bodies to a fixed point, so route eval_tick through it.
+    -- Found by the CudaArray co-simulation (Game of Life, 8 neighbours).
+    let evalTickFn :=
+      if hasEvalCycle then
+        s!"{funcQual}static void sparkle_{className}_eval_tick({structName}* self) \{\n" ++
+        s!"    sparkle_{className}_eval(self);\n" ++
+        s!"    sparkle_{className}_tick(self);\n" ++
+        "}\n\n"
+      else evalTickFn
+
     structDecl ++ resetFn ++ evalFn ++ tickFn ++ evalTickFn
 
 /-- Backend-local pre-pass: hoist wide (>64-bit) compound expressions out

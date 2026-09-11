@@ -338,6 +338,13 @@ lean_exe «cuda-intra-cosim» where
   root := `Tests.Drivers.CudaIntraCosimMain
   supportInterpreter := true
 
+-- CUDA regular-array backend: topology detection checks + co-simulation of
+-- the emitted dim3 kernels against CSim (CPU emulator always; nvcc compile
+-- when present; real GPU run gated on SPARKLE_CUDA=1).
+lean_exe «cuda-array-cosim» where
+  root := `Tests.Drivers.CudaArrayCosimMain
+  supportInterpreter := true
+
 -- SMT bridge Layer 2: emit BMC queries (always), run z3 + replay
 -- counterexamples on the CSim C reference when z3/gcc are present
 -- (skips cleanly otherwise).  Layer 1 is Tests.TestSmt under lake test.
